@@ -78,14 +78,14 @@ describe("PvpController State & Commands", () => {
     expect(mockSettings.overrides["retry.modelFallback"]).toBe(false);
     expect(mockSettings.overrides["retry.enabled"]).toBe(false);
     expect(mockSettings.overrides["retry.fallbackChains"]).toEqual({});
-    expect(ui.statuses[PVP_STATUS_KEY]).toBe("pvp on");
+    expect(ui.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
     expect(ui.widgets[PVP_WIDGET_KEY]?.options).toEqual({ placement: "belowEditor" });
     expect(ui.notifications[0]?.msg).toBe("PVP ON");
 
     controller.handleCommand("on", { ui });
     expect(controller.currentMode).toBe("persistent");
-    expect(ui.statuses[PVP_STATUS_KEY]).toBe("pvp on");
+    expect(ui.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
     expect(ui.notifications[1]?.msg).toBe("PVP ON");
   });
@@ -101,7 +101,7 @@ describe("PvpController State & Commands", () => {
     expect(controller.isAntiFallbackApplied).toBe(true);
     expect(mockSettings.overrides["retry.modelFallback"]).toBe(false);
     expect(mockSettings.overrides["retry.enabled"]).toBe(false);
-    expect(ui.statuses[PVP_STATUS_KEY]).toBe("pvp one");
+    expect(ui.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp one"]);
     expect(ui.widgets[PVP_WIDGET_KEY]?.options).toEqual({ placement: "belowEditor" });
     expect(ui.notifications[0]?.msg).toBe("PVP ONE");
@@ -114,7 +114,8 @@ describe("PvpController State & Commands", () => {
 
     controller.enable("persistent", ui);
     expect(controller.isAntiFallbackApplied).toBe(true);
-    expect(ui.statuses[PVP_STATUS_KEY]).toBe("pvp on");
+    expect(ui.statuses[PVP_STATUS_KEY]).toBeUndefined();
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
 
     controller.handleCommand("off", { ui });
     expect(controller.currentMode).toBe("off");
@@ -136,6 +137,20 @@ describe("PvpController State & Commands", () => {
 
     expect(controller.currentMode).toBe("persistent");
     expect(ui.notifications.some((n) => n.type === "warning")).toBe(true);
+  });
+
+  it("falls back to ui.setStatus if ui.setWidget is not a function", () => {
+    const controller = new PvpController();
+    const minimalUi = {
+      setStatus: (key: string, text?: string) => {
+        minimalUi.statuses[key] = text;
+      },
+      notify: () => {},
+      statuses: {} as Record<string, string | undefined>,
+    };
+
+    controller.enable("persistent", minimalUi as any);
+    expect(minimalUi.statuses[PVP_STATUS_KEY]).toBe("pvp on");
   });
 
   it("provides argument completions correctly", () => {

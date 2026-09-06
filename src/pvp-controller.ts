@@ -129,9 +129,11 @@ export class PvpController {
     }
 
     const styledText = formatPvpStatus(this.mode, this.attemptCount, ui.theme);
-
-    ui.setStatus(PVP_STATUS_KEY, styledText);
     if (typeof ui.setWidget === "function") {
+      // In OMP, statusLine renders hookStatuses in statusHost directly adjacent to hookWidgetContainerBelow.
+      // Calling both setStatus and setWidget causes OMP to render duplicate "pvp on" lines.
+      // Therefore, prefer the native belowEditor widget and ensure statusLine hook status is cleared.
+      ui.setStatus(PVP_STATUS_KEY, undefined);
       const mode = this.mode;
       const attemptCount = this.attemptCount;
       ui.setWidget(
@@ -144,6 +146,9 @@ export class PvpController {
         }),
         { placement: "belowEditor" }
       );
+    } else {
+      const styledText = formatPvpStatus(this.mode, this.attemptCount, ui.theme);
+      ui.setStatus(PVP_STATUS_KEY, styledText);
     }
   }
 

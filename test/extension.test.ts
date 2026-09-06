@@ -146,7 +146,7 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     // 1. User enters /pvp
     const pvpCmd = commands.get("pvp");
     await pvpCmd.handler("", ctx);
-    expect(ctx.statuses[PVP_STATUS_KEY]).toBe("pvp on");
+    expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
     expect(ctx.widgets[PVP_WIDGET_KEY]?.options).toEqual({ placement: "belowEditor" });
     expect(ctx.notifications[0]?.msg).toBe("PVP ON");
@@ -195,7 +195,8 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     turnEnd({ type: "turn_end", turnIndex: 2, message: successMsg, toolResults: [] }, ctx);
 
     // Persistent mode keeps status bar and widget active
-    expect(ctx.statuses[PVP_STATUS_KEY]).toBe("pvp on");
+    // Persistent mode keeps widget active and avoids duplicate statusLine render in OMP
+    expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
   });
 
@@ -207,7 +208,7 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     // 1. User enters /pvp one
     const pvpCmd = commands.get("pvp");
     await pvpCmd.handler("one", ctx);
-    expect(ctx.statuses[PVP_STATUS_KEY]).toBe("pvp one");
+    expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp one"]);
     expect(ctx.widgets[PVP_WIDGET_KEY]?.options).toEqual({ placement: "belowEditor" });
     expect(ctx.notifications[0]?.msg).toBe("PVP ONE");
@@ -233,7 +234,7 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     expect(sentMessages).toHaveLength(1);
-    expect(ctx.statuses[PVP_STATUS_KEY]).toBe("pvp one (第 1 次重试)");
+    expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp one (第 1 次重试)"]);
 
     // 4. Retry turn succeeds
@@ -330,7 +331,7 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
 
     const pvpCmd = commands.get("pvp");
     await pvpCmd.handler("", ctx);
-    expect(ctx.statuses[PVP_STATUS_KEY]).toBe("pvp on");
+    expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
 
     const sessionShutdown = handlers.get("session_shutdown")![0];
