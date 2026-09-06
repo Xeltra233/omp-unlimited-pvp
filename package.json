@@ -6,6 +6,7 @@
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
+    "build": "bun x tsc",
     "test": "bun test",
     "typecheck": "bun x tsc --noEmit"
   },
