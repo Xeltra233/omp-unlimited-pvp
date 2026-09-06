@@ -1,0 +1,303 @@
+import { describe, expect, it, mock } from "bun:test";
+import {
+  formatPvpStatus,
+  getPvpArgumentCompletions,
+  PvpController,
+  PVP_STATUS_KEY,
+  PVP_WIDGET_KEY,
+  type PvpAgentMessage,
+  type PvpUi,
+} from "../src/pvp-controller.js";
+import type { SettingsLike } from "../src/settings-guard.js";
+
+function createMockUi(): PvpUi & {
+  statuses: Record<string, string | undefined>;
+  widgets: Record<string, { content: string[] | undefined; options?: any }>;
+  notifications: Array<{ msg: string; type?: string }>;
+} {
+  const statuses: Record<string, string | undefined> = {};
+  const widgets: Record<string, { content: string[] | undefined; options?: any }> = {};
+  const notifications: Array<{ msg: string; type?: string }> = [];
+
+  return {
+    statuses,
+    widgets,
+    notifications,
+    setStatus: mock((key: string, value: string | undefined) => {
+      statuses[key] = value;
+    }),
+    setWidget: mock((key: string, content: any, options?: any) => {
+      let resolvedContent: string[] | undefined;
+      if (typeof content === "function") {
+        const comp = content({}, undefined);
+        resolvedContent = comp?.render?.(80);
+      } else {
+        resolvedContent = content;
+      }
+      widgets[key] = { content: resolvedContent, options };
+    }),
+    notify: mock((msg: string, type?: "info" | "warning" | "error") => {
+      notifications.push({ msg, type });
+    }),
+  };
+}
+
+function createMockSettings(): SettingsLike & { overrides: Record<string, unknown> } {
+  const overrides: Record<string, unknown> = {};
+  return {
+    overrides,
+    override: mock((path: string, val: unknown) => {
+      overrides[path] = val;
+    }),
+    clearOverride: mock((path: string) => {
+      delete overrides[path];
+    }),
+  };
+}
+
+describe("PvpController State & Commands", () => {
+  it("starts in 'off' mode with no status bar marker", () => {
+    const controller = new PvpController();
+    expect(controller.currentMode).toBe("off");
+    expect(controller.enabled).toBe(false);
+    expect(controller.isPendingRetry).toBe(false);
+    expect(controller.currentAttempt).toBe(0);
+    expect(controller.hasTimer).toBe(false);
+    expect(controller.isAntiFallbackApplied).toBe(false);
+  });
+
+  it("handles '/pvp' and '/pvp on' to enable persistent mode with anti-fallback", () => {
+    const mockSettings = createMockSettings();
+    const controller = new PvpController(mockSettings);
+    const ui = createMockUi();
+
+    controller.handleCommand("", { ui });
+    expect(controller.currentMode).toBe("persistent");
+    expect(controller.enabled).toBe(true);
+    expect(controller.isAntiFallbackApplied).toBe(true);
+    expect(mockSettings.overrides["retry.modelFallback"]).toBe(false);
+    expect(mockSettings.overrides["retry.enabled"]).toBe(false);
+    expect(mockSettings.overrides["retry.fallbackChains"]).toEqual({});
+    expect(ui.statuses[PVP_STATUS_KEY]).toBe("pvp on");
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.options).toEqual({ placement: "belowEditor" });
+    expect(ui.notifications[0]?.msg).toBe("PVP ON");
+
+    controller.handleCommand("on", { ui });
+    expect(controller.currentMode).toBe("persistent");
+    expect(ui.statuses[PVP_STATUS_KEY]).toBe("pvp on");
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
+    expect(ui.notifications[1]?.msg).toBe("PVP ON");
+  });
+
+  it("handles '/pvp one' to enable one-success mode with anti-fallback", () => {
+    const mockSettings = createMockSettings();
+    const controller = new PvpController(mockSettings);
+    const ui = createMockUi();
+
+    controller.handleCommand("one", { ui });
+    expect(controller.currentMode).toBe("one");
+    expect(controller.enabled).toBe(true);
+    expect(controller.isAntiFallbackApplied).toBe(true);
+    expect(mockSettings.overrides["retry.modelFallback"]).toBe(false);
+    expect(mockSettings.overrides["retry.enabled"]).toBe(false);
+    expect(ui.statuses[PVP_STATUS_KEY]).toBe("pvp one");
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp one"]);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.options).toEqual({ placement: "belowEditor" });
+    expect(ui.notifications[0]?.msg).toBe("PVP ONE");
+  });
+
+  it("handles '/pvp off' to disable, clear UI, and restore OMP fallback settings", () => {
+    const mockSettings = createMockSettings();
+    const controller = new PvpController(mockSettings);
+    const ui = createMockUi();
+
+    controller.enable("persistent", ui);
+    expect(controller.isAntiFallbackApplied).toBe(true);
+    expect(ui.statuses[PVP_STATUS_KEY]).toBe("pvp on");
+
+    controller.handleCommand("off", { ui });
+    expect(controller.currentMode).toBe("off");
+    expect(controller.enabled).toBe(false);
+    expect(controller.isAntiFallbackApplied).toBe(false);
+    expect(mockSettings.overrides["retry.modelFallback"]).toBeUndefined();
+    expect(mockSettings.overrides["retry.enabled"]).toBeUndefined();
+    expect(ui.statuses[PVP_STATUS_KEY]).toBeUndefined();
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toBeUndefined();
+    expect(ui.notifications.some((n) => n.msg === "PVP OFF")).toBe(true);
+  });
+
+  it("warns on unknown command and preserves mode", () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+
+    controller.enable("persistent", ui);
+    controller.handleCommand("unknown-arg", { ui });
+
+    expect(controller.currentMode).toBe("persistent");
+    expect(ui.notifications.some((n) => n.type === "warning")).toBe(true);
+  });
+
+  it("provides argument completions correctly", () => {
+    expect(getPvpArgumentCompletions("")).toEqual([
+      { value: "on", label: "on" },
+      { value: "one", label: "one" },
+      { value: "off", label: "off" },
+    ]);
+    expect(getPvpArgumentCompletions("o")).toEqual([
+      { value: "on", label: "on" },
+      { value: "one", label: "one" },
+      { value: "off", label: "off" },
+    ]);
+    expect(getPvpArgumentCompletions("on")).toEqual([
+      { value: "on", label: "on" },
+      { value: "one", label: "one" },
+    ]);
+    expect(getPvpArgumentCompletions("of")).toEqual([
+      { value: "off", label: "off" },
+    ]);
+    expect(getPvpArgumentCompletions("invalid")).toBeNull();
+  });
+});
+
+describe("PvpController Prompt Recording", () => {
+  it("records prompt text and image attachments", () => {
+    const controller = new PvpController();
+    controller.recordPrompt("Test prompt", [{ type: "image", data: "base64", mimeType: "image/png" }]);
+
+    expect(controller.recordedPrompt).toBe("Test prompt");
+    expect(controller.recordedImages).toHaveLength(1);
+    expect(controller.recordedImages?.[0]?.type).toBe("image");
+  });
+});
+
+describe("PvpController Turn Outcomes & Retries", () => {
+  it("flags pending retry upon error in persistent mode", () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+    controller.enable("persistent", ui);
+
+    const errorMessage: PvpAgentMessage = {
+      role: "assistant",
+      content: [],
+      api: "anthropic-messages",
+      provider: "anthropic",
+      model: "claude-3-5-sonnet",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      stopReason: "error",
+      errorMessage: "Rate limit reached (429)",
+      timestamp: Date.now(),
+    } as any;
+
+    const result = controller.handleTurnEnd(errorMessage, ui);
+    expect(result.shouldRetry).toBe(true);
+    expect(result.success).toBe(false);
+    expect(controller.isPendingRetry).toBe(true);
+    expect(controller.lastErrorMessage).toBe("Rate limit reached (429)");
+  });
+
+  it("schedules immediate retry on settled event without cooldown", async () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+    controller.enable("persistent", ui);
+    controller.recordPrompt("Retry prompt");
+
+    const errorMessage: PvpAgentMessage = {
+      role: "assistant",
+      content: [],
+      api: "anthropic-messages",
+      provider: "anthropic",
+      model: "claude-3-5-sonnet",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      stopReason: "error",
+      errorMessage: "Service unavailable (503)",
+      timestamp: Date.now(),
+    } as any;
+
+    controller.handleTurnEnd(errorMessage, ui);
+
+    let sentPrompt: string | undefined;
+    const sendFn = mock((prompt: string) => {
+      sentPrompt = prompt;
+    });
+
+    const scheduled = controller.scheduleRetry(sendFn, ui);
+    expect(scheduled).toBe(true);
+    expect(controller.currentAttempt).toBe(1);
+    expect(ui.notifications.some((n) => n.msg.includes("正在无延迟重试"))).toBe(true);
+
+    // Await the setTimeout(..., 0)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    expect(sentPrompt).toBe("Retry prompt");
+  });
+
+  it("clears pending retry and turns off in 'one' mode upon success", () => {
+    const mockSettings = createMockSettings();
+    const controller = new PvpController(mockSettings);
+    const ui = createMockUi();
+    controller.enable("one", ui);
+    expect(controller.isAntiFallbackApplied).toBe(true);
+
+    const successMessage: PvpAgentMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Answer" }],
+      api: "anthropic-messages",
+      provider: "anthropic",
+      model: "claude-3-5-sonnet",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    } as any;
+
+    const result = controller.handleTurnEnd(successMessage, ui);
+    expect(result.shouldRetry).toBe(false);
+    expect(result.success).toBe(true);
+    expect(controller.currentMode).toBe("off");
+    expect(controller.enabled).toBe(false);
+    expect(controller.isAntiFallbackApplied).toBe(false);
+    expect(mockSettings.overrides["retry.modelFallback"]).toBeUndefined();
+    expect(ui.notifications.some((n) => n.msg === "PVP OFF")).toBe(true);
+  });
+
+  it("cancels retry on user abort", () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+    controller.enable("persistent", ui);
+
+    const abortMessage: PvpAgentMessage = {
+      role: "assistant",
+      content: [],
+      api: "anthropic-messages",
+      provider: "anthropic",
+      model: "claude-3-5-sonnet",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      stopReason: "aborted",
+      timestamp: Date.now(),
+    } as any;
+
+    const result = controller.handleTurnEnd(abortMessage, ui);
+    expect(result.shouldRetry).toBe(false);
+    expect(result.success).toBe(false);
+    expect(controller.isPendingRetry).toBe(false);
+  });
+});
+
+describe("formatPvpStatus", () => {
+  it("formats status string with and without attempts", () => {
+    expect(formatPvpStatus("persistent", 0)).toBe("pvp on");
+    expect(formatPvpStatus("one", 0)).toBe("pvp one");
+    expect(formatPvpStatus("persistent", 3)).toContain("pvp on");
+    expect(formatPvpStatus("persistent", 3)).toContain("(第 3 次重试)");
+  });
+
+  it("respects theme colors if provided", () => {
+    const mockTheme = {
+      fg: (color: string, text: string) => `[${color}]${text}[/${color}]`,
+    } as any;
+
+    const res = formatPvpStatus("persistent", 2, mockTheme);
+    expect(res).toContain("[muted]pvp on[/muted]");
+    expect(res).toContain("[dim](第 2 次重试)[/dim]");
+  });
+});

@@ -7,7 +7,7 @@
   "types": "./src/index.ts",
   "scripts": {
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "bun x tsc --noEmit"
   },
   "files": [
     "LICENSE",
