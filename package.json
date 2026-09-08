@@ -1,20 +1,21 @@
 {
   "name": "omp-unlimited-pvp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Unlimited automatic retry mode for OMP (Oh My Pi) without cooldown, retry count limits, or model fallback triggers.",
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
-    "build": "bun x tsc",
+    "build": "tsc",
     "test": "bun test",
-    "typecheck": "bun x tsc --noEmit"
+    "typecheck": "tsc --noEmit"
   },
   "files": [
     "LICENSE",
     "README.md",
     "README.en.md",
-    "src/"
+    "src/",
+    "dist/"
   ],
   "keywords": [
     "omp-package",

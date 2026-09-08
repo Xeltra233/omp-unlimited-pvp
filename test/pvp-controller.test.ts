@@ -295,6 +295,163 @@ describe("PvpController Turn Outcomes & Retries", () => {
     expect(result.shouldRetry).toBe(false);
     expect(result.success).toBe(false);
     expect(controller.isPendingRetry).toBe(false);
+    expect(controller.currentAttempt).toBe(0);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
+  });
+
+  it("preserves retry count across consecutive retry cycles and before_agent_start", async () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+    controller.enable("persistent", ui);
+    controller.recordPrompt("Infinite test");
+
+    const errorMessage: PvpAgentMessage = {
+      role: "assistant",
+      content: [],
+      stopReason: "error",
+      errorMessage: "HTTP 500",
+    } as any;
+
+    const sendFn = mock(() => {});
+
+    for (let i = 1; i <= 5; i++) {
+      controller.handleTurnEnd(errorMessage, ui);
+      controller.scheduleRetry(sendFn, ui);
+      expect(controller.currentAttempt).toBe(i);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(sendFn).toHaveBeenCalledTimes(i);
+      // Simulate OMP firing before_agent_start on the retried run:
+      controller.recordPrompt("Infinite test");
+      // Counter must be preserved and NOT reset to zero!
+      expect(controller.currentAttempt).toBe(i);
+    }
+  });
+
+  it("resets retry count on success, and restarts count from 1 on subsequent failure", async () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+    controller.enable("persistent", ui);
+    controller.recordPrompt("Task 1");
+
+    const errorMessage: PvpAgentMessage = {
+      role: "assistant",
+      content: [],
+      api: "anthropic-messages",
+      provider: "anthropic",
+      model: "m",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      stopReason: "error",
+      errorMessage: "500 Error",
+      timestamp: Date.now(),
+    } as any;
+
+    const sendFn = mock(() => {});
+
+    // Round 1: fail -> retry (attempt 1)
+    controller.handleTurnEnd(errorMessage, ui);
+    controller.scheduleRetry(sendFn, ui);
+    expect(controller.currentAttempt).toBe(1);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 1 次重试)"]);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.recordPrompt("Task 1");
+    expect(controller.currentAttempt).toBe(1);
+
+    // Round 2: fail -> retry (attempt 2)
+    controller.handleTurnEnd(errorMessage, ui);
+    controller.scheduleRetry(sendFn, ui);
+    expect(controller.currentAttempt).toBe(2);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 2 次重试)"]);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.recordPrompt("Task 1");
+    expect(controller.currentAttempt).toBe(2);
+
+    // Round 3: succeeds!
+    const successMessage: PvpAgentMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Done" }],
+      api: "anthropic-messages",
+      provider: "anthropic",
+      model: "m",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    } as any;
+    const successResult = controller.handleTurnEnd(successMessage, ui);
+    expect(successResult.success).toBe(true);
+    // Count must be reset to 0!
+    expect(controller.currentAttempt).toBe(0);
+    // Widget must be restored to clean "pvp on" without attempt counter
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
+
+    // Subsequent prompt or failure must restart count from 1!
+    controller.recordPrompt("Task 2", undefined, ui);
+    expect(controller.currentAttempt).toBe(0);
+
+    controller.handleTurnEnd(errorMessage, ui);
+    controller.scheduleRetry(sendFn, ui);
+    expect(controller.currentAttempt).toBe(1);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 1 次重试)"]);
+  });
+
+  it("resets retry count and cleans UI when a brand new user prompt is submitted", () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+    controller.enable("persistent", ui);
+    controller.recordPrompt("Task A");
+
+    const errorMessage: PvpAgentMessage = {
+      role: "assistant",
+      content: [],
+      stopReason: "error",
+      errorMessage: "Fail",
+    } as any;
+
+    const sendFn = mock(() => {});
+    controller.handleTurnEnd(errorMessage, ui);
+    controller.scheduleRetry(sendFn, ui);
+    expect(controller.currentAttempt).toBe(1);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 1 次重试)"]);
+
+    // User submits a new prompt manually before/during retry:
+    controller.recordPrompt("Brand new task B", undefined, ui);
+    expect(controller.currentAttempt).toBe(0);
+    expect(controller.recordedPrompt).toBe("Brand new task B");
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
+  });
+
+  it("tracks isRetryInFlight status during scheduling and execution", async () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+    controller.enable("persistent", ui);
+    controller.recordPrompt("Test prompt");
+
+    expect(controller.isRetryInFlight).toBe(false);
+
+    const errorMessage: PvpAgentMessage = {
+      role: "assistant",
+      content: [],
+      stopReason: "error",
+      errorMessage: "Fail",
+    } as any;
+
+    controller.handleTurnEnd(errorMessage, ui);
+
+    let inFlightDuringSend = false;
+    const sendFn = mock(() => {
+      inFlightDuringSend = controller.isRetryInFlight;
+    });
+
+    controller.scheduleRetry(sendFn, ui);
+    expect(controller.isRetryInFlight).toBe(false);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    expect(inFlightDuringSend).toBe(true);
+    expect(controller.isRetryInFlight).toBe(true);
+
+    // Consumed by recordPrompt on next agent start
+    controller.recordPrompt("Test prompt");
+    expect(controller.isRetryInFlight).toBe(false);
   });
 });
 

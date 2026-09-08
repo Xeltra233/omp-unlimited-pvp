@@ -38,7 +38,7 @@ export default function pvpExtension(pi: ExtensionAPI): void {
 
   // Track the most recent user prompt and any attached images, and capture the active model
   pi.on("before_agent_start", (event, ctx) => {
-    controller.recordPrompt(event.prompt, event.images);
+    controller.recordPrompt(event.prompt, event.images, ctx.ui);
     try {
       const current = (ctx as any)?.model ?? (ctx as any)?.models?.current?.();
       if (current) {
