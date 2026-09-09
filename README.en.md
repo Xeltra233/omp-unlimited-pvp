@@ -81,6 +81,15 @@ Type `/pvp ` and press `Tab` to autocomplete `on`, `one`, `off`.
 
 ---
 
+## 🔍 How It Works
+
+1. **Native In-Place Retry**: When PVP is enabled, the plugin hooks into the underlying agent execution loop. Upon error, it removes the failed assistant message and retries in place (`agent.continue()`), **never dispatching duplicate user messages** into the chat transcript.
+2. **Anti-Fallback & Zero Delay**: Overrides OMP runtime settings via `Settings.override` to disable model fallback (`retry.modelFallback = false`) and fallback chains, while eliminating retry delay (`retry.baseDelayMs = 0`) and removing attempt caps (`retry.maxRetries = 999999`).
+3. **Live Status Synchronization**: Real-time status update below the input editor (`pvp on (第 X 次重试)`).
+4. **Lifecycle & Completion**: Resets retry count to zero upon successful turn completion (`stop` / `length`). In one-shot mode (`/pvp one`), automatically turns off and restores original settings.
+
+---
+
 ## 🛠️ Development & Testing
 
 ```bash

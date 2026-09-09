@@ -48,10 +48,15 @@ export class SettingsGuard {
     try {
       // Disable OMP's model fallback chain completely
       s.override("retry.modelFallback", false);
-      // Disable OMP's internal backoff retry loop so failure immediately finishes turn
-      s.override("retry.enabled", false);
       // Clear fallback chains to guarantee no candidate model switch
       s.override("retry.fallbackChains", {});
+      // Keep retry enabled in OMP settings so recovery pipeline can proceed
+      s.override("retry.enabled", true);
+      // Set infinite/unlimited retry attempts without cap
+      s.override("retry.maxRetries", 999999);
+      // Remove backoff delay for immediate 0ms retry
+      s.override("retry.baseDelayMs", 0);
+      s.override("retry.maxDelayMs", 0);
       this.overridesApplied = true;
       return true;
     } catch {
@@ -69,8 +74,11 @@ export class SettingsGuard {
 
     try {
       s.clearOverride("retry.modelFallback");
-      s.clearOverride("retry.enabled");
       s.clearOverride("retry.fallbackChains");
+      s.clearOverride("retry.enabled");
+      s.clearOverride("retry.maxRetries");
+      s.clearOverride("retry.baseDelayMs");
+      s.clearOverride("retry.maxDelayMs");
       this.overridesApplied = false;
       return true;
     } catch {

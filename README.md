@@ -90,21 +90,13 @@ omp -e /path/to/omp-unlimited-pvp
 
 ## 🔍 工作原理
 
-1. **防 Fallback 拦截与设置覆盖**：
-   - 开启 PVP 时，`SettingsGuard` 介入，通过内存级 `Settings.override` 接口禁用 `retry.modelFallback` 和 `retry.enabled`。
-   - 这一方面阻止了 OMP 内核在报错后自动触发模型降级链，另一方面关闭了内核默认的 2s/4s 指数退避重试，使失败能立即交付给会话层。
-2. **提示词与多模态快照**：
-   - 在 `before_agent_start` 生命周期中记录用户输入的 prompt 文本与附带的多模态图片，同时记录当前会话的原始模型引用。
-3. **异常检测与重试标记**：
-   - 在 `turn_end` 捕获到模型错误（`stopReason === "error"`），标记 `pendingRetry = true` 并递增当前重试轮次，实时更新 UI 挂件显示 `(第 N 次重试)`。
-4. **结算后零延迟派发**：
-   - 在 OMP 的 `agent_end` 事件中（确认 `willContinue === false` 且会话完全结算），通过微任务 `setTimeout(..., 0)` 调用 `pi.sendUserMessage`（携带 `{ deliverAs: "followUp" }`），无延迟发起重试。
-5. **成功重置与安全清理**：
-   - 当模型返回 `stop` 或 `length` 时判定成功：
-     - 若处于 `one` 模式，自动退出 PVP 模式、调用 `clearOverride` 还原配置，并提示 `PVP OFF`；
-     - 若处于 `persistent` 模式，清空重试计数并维持 PVP 开启状态。
-   - 用户主动 `Ctrl+C` 中断（`stopReason === "aborted"`）时立即取消任何计划中的重试。
-
+1. **原生就地重试（In-Place Retry）**：当开启 PVP 模式时，插件深度联动 OMP / Pi 核心运行循环，在模型请求或网络失败时就地移除报错 assistant 消息并直接在底层状态机就地重试（`agent.continue()`），**绝不通过发送新消息来模拟重试**，不污染聊天历史与上下文。
+2. **防 Fallback 拦截与设置覆盖**：开启 PVP 时，`SettingsGuard` 介入，通过内存级 `Settings.override` 接口禁用 `retry.modelFallback` 并清空 `retry.fallbackChains`，同时保持重试链路就绪，解除次数上限（`retry.maxRetries = 999999`）与退避延迟（`retry.baseDelayMs = 0`），坚决锁定当前所选模型。
+3. **状态同步与尝试计数**：重试发生时实时更新挂载在输入框下方的 widget 与底部状态栏标记（`pvp on (第 X 次重试)`），清楚感知当前重试进度。
+4. **成功判定与生命周期**：
+   - 收到 `stop` 或 `length` 等正常终结信号即判定为成功，重试计数清零。
+   - 一次性模式（`one`）成功后自动执行 `disable()`、还原 OMP 原始设置并发送 `PVP OFF` 通知。
+   - 用户主动按下 `Ctrl+C` 中断时立即停止重试，重试计数清零。
 ---
 
 ## 🛠️ 本地开发与测试

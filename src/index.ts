@@ -1,19 +1,21 @@
 import type { Model } from "@oh-my-pi/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import {
   formatPvpStatus,
   getPvpArgumentCompletions,
+  installPvpRetryHook,
   PvpController,
   PVP_STATUS_KEY,
   PVP_WIDGET_KEY,
+  SettingsGuard,
   type PvpAgentMessage,
   type PvpCommandContext,
   type PvpImageContent,
   type PvpMode,
   type PvpUi,
+  type SettingsLike,
   type TurnEndResult,
 } from "./pvp-controller.js";
-import { SettingsGuard, type SettingsLike } from "./settings-guard.js";
 
 /**
  * OMP Unlimited PVP Extension.
@@ -26,6 +28,7 @@ import { SettingsGuard, type SettingsLike } from "./settings-guard.js";
  */
 export default function pvpExtension(pi: ExtensionAPI): void {
   const controller = new PvpController();
+  const uninstallHook = installPvpRetryHook(controller);
   let originalModel: Model | undefined = undefined;
 
   pi.registerCommand("pvp", {
@@ -36,9 +39,9 @@ export default function pvpExtension(pi: ExtensionAPI): void {
     },
   });
 
-  // Track the most recent user prompt and any attached images, and capture the active model
-  pi.on("before_agent_start", (event, ctx) => {
-    controller.recordPrompt(event.prompt, event.images, ctx.ui);
+  // Track new user prompt submission to reset retry count, and capture the active model
+  pi.on("before_agent_start", (_event, ctx) => {
+    controller.handleNewPrompt(ctx.ui);
     try {
       const current = (ctx as any)?.model ?? (ctx as any)?.models?.current?.();
       if (current) {
@@ -65,49 +68,14 @@ export default function pvpExtension(pi: ExtensionAPI): void {
     }
   });
 
-  // Observe turn results: error triggers pending retry; success resets or closes
+  // Observe turn results: success resets/closes mode; abort cancels
   pi.on("turn_end", (event, ctx) => {
     controller.handleTurnEnd(event.message, ctx.ui);
   });
 
-  // Dispatch immediate retry once the agent run has settled:
-  // In OMP, agent_end is emitted when an agent finishes. If willContinue is true,
-  // an internal auto-continuation was scheduled, so we wait for the terminal settle.
-  const triggerRetryIfPending = (ui: PvpUi) => {
-    controller.scheduleRetry((prompt, images) => {
-      try {
-        if (images && images.length > 0) {
-          pi.sendUserMessage(
-            [{ type: "text", text: prompt }, ...images],
-            { deliverAs: "followUp" }
-          );
-        } else {
-          pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-        }
-      } catch {
-        // Guard against unexpected send failures
-      }
-    }, ui);
-  };
-
-  pi.on("agent_end", (event, ctx) => {
-    if (event.willContinue) {
-      return;
-    }
-    triggerRetryIfPending(ctx.ui);
-  });
-
-  // Backward compatibility with runtimes or Pi forks that emit agent_settled
-  try {
-    (pi as any).on?.("agent_settled", (_event: any, ctx: ExtensionContext) => {
-      triggerRetryIfPending(ctx.ui);
-    });
-  } catch {
-    // Ignore if agent_settled is unsupported
-  }
-
   // Ensure clean teardown when session shuts down
   pi.on("session_shutdown", (_event, ctx) => {
+    uninstallHook();
     controller.cleanup(ctx.ui);
     originalModel = undefined;
   });
@@ -116,6 +84,7 @@ export default function pvpExtension(pi: ExtensionAPI): void {
 export {
   formatPvpStatus,
   getPvpArgumentCompletions,
+  installPvpRetryHook,
   PvpController,
   PVP_STATUS_KEY,
   PVP_WIDGET_KEY,

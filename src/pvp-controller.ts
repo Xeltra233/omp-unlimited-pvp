@@ -1,11 +1,13 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import type {
-  BeforeAgentStartEvent,
-  ExtensionCommandContext,
-  ExtensionUIContext,
-  TurnEndEvent,
+import {
+  AgentSession,
+  type BeforeAgentStartEvent,
+  type ExtensionCommandContext,
+  type ExtensionUIContext,
+  type TurnEndEvent,
 } from "@oh-my-pi/pi-coding-agent";
 import { SettingsGuard, type SettingsLike } from "./settings-guard.js";
+export { SettingsGuard, type SettingsLike };
 
 export const PVP_STATUS_KEY = "omp-unlimited-pvp";
 export const PVP_WIDGET_KEY = "omp-unlimited-pvp";
@@ -52,13 +54,12 @@ export function formatPvpStatus(
 }
 
 /**
- * Owns the PVP state machine, prompt tracking, zero-delay retry orchestration,
+ * Owns the PVP state machine, zero-delay retry orchestration,
  * and OMP anti-fallback protection.
  *
  * Supported modes:
  * - "persistent": /pvp or /pvp on. Retries infinitely without cooldown upon failure,
- *   disables OMP model fallback and internal backoff, and remains enabled even after
- *   success until manually turned off.
+ *   disables OMP model fallback, and remains enabled even after success until manually turned off.
  * - "one": /pvp one. Retries infinitely without cooldown upon failure, and automatically
  *   turns off and restores OMP settings when the model response succeeds.
  * - "off": disabled, no retries, status bar hidden, original OMP settings active.
@@ -73,6 +74,7 @@ export class PvpController {
   private retryInFlight: boolean = false;
   private lastError: string | undefined = undefined;
   private settingsGuard: SettingsGuard;
+  private activeUi: PvpUi | undefined = undefined;
 
   constructor(settings?: SettingsLike | SettingsGuard) {
     if (settings instanceof SettingsGuard) {
@@ -122,25 +124,35 @@ export class PvpController {
     return this.settingsGuard.isApplied;
   }
 
+  get lastUi(): PvpUi | undefined {
+    return this.activeUi;
+  }
+
   /** Update footer status and persistent widget docked below the editor with native styling and zero indentation. */
-  private updateUi(ui: PvpUi): void {
+  updateUi(ui?: PvpUi): void {
+    const targetUi = ui ?? this.activeUi;
+    if (!targetUi) {
+      return;
+    }
+    this.activeUi = targetUi;
+
     if (this.mode === "off") {
-      ui.setStatus(PVP_STATUS_KEY, undefined);
-      if (typeof ui.setWidget === "function") {
-        ui.setWidget(PVP_WIDGET_KEY, undefined);
+      targetUi.setStatus(PVP_STATUS_KEY, undefined);
+      if (typeof targetUi.setWidget === "function") {
+        targetUi.setWidget(PVP_WIDGET_KEY, undefined);
       }
       return;
     }
 
-    const styledText = formatPvpStatus(this.mode, this.attemptCount, ui.theme);
-    if (typeof ui.setWidget === "function") {
+    const styledText = formatPvpStatus(this.mode, this.attemptCount, targetUi.theme);
+    if (typeof targetUi.setWidget === "function") {
       // In OMP, statusLine renders hookStatuses in statusHost directly adjacent to hookWidgetContainerBelow.
       // Calling both setStatus and setWidget causes OMP to render duplicate "pvp on" lines.
       // Therefore, prefer the native belowEditor widget and ensure statusLine hook status is cleared.
-      ui.setStatus(PVP_STATUS_KEY, undefined);
+      targetUi.setStatus(PVP_STATUS_KEY, undefined);
       const mode = this.mode;
       const attemptCount = this.attemptCount;
-      ui.setWidget(
+      targetUi.setWidget(
         PVP_WIDGET_KEY,
         (_tui, theme) => ({
           render(_width: number): string[] {
@@ -151,24 +163,26 @@ export class PvpController {
         { placement: "belowEditor" }
       );
     } else {
-      const styledText = formatPvpStatus(this.mode, this.attemptCount, ui.theme);
-      ui.setStatus(PVP_STATUS_KEY, styledText);
+      targetUi.setStatus(PVP_STATUS_KEY, styledText);
     }
   }
 
   /** Enable resident mode or one-success mode with anti-fallback protection. */
-  enable(mode: Exclude<PvpMode, "off">, ui: PvpUi): void {
+  enable(mode: Exclude<PvpMode, "off">, ui?: PvpUi): void {
     this.cancelRetry();
     this.mode = mode;
     this.attemptCount = 0;
     this.retryInFlight = false;
     this.lastError = undefined;
+    if (ui) {
+      this.activeUi = ui;
+    }
     this.settingsGuard.applyAntiFallbackOverrides();
     this.updateUi(ui);
   }
 
   /** Disable PVP, cancel pending retries, clear status/widget, and restore OMP settings. */
-  disable(ui: PvpUi): void {
+  disable(ui?: PvpUi): void {
     this.cancelRetry();
     this.mode = "off";
     this.lastPrompt = undefined;
@@ -176,6 +190,9 @@ export class PvpController {
     this.attemptCount = 0;
     this.retryInFlight = false;
     this.lastError = undefined;
+    if (ui) {
+      this.activeUi = ui;
+    }
     this.settingsGuard.clearAntiFallbackOverrides();
     this.updateUi(ui);
   }
@@ -186,35 +203,121 @@ export class PvpController {
     this.lastImages = images && images.length > 0 ? [...images] : undefined;
 
     if (this.retryInFlight) {
-      // This run is the PVP automatic retry in flight: preserve attempt count and consume flag
       this.retryInFlight = false;
     } else {
-      // This is a fresh prompt from the user: cancel pending retry and reset counter to zero
       this.cancelRetry();
       const hadAttempts = this.attemptCount > 0 || this.lastError !== undefined;
       this.attemptCount = 0;
       this.lastError = undefined;
-      if (hadAttempts && ui && this.enabled) {
+      if (hadAttempts && (ui || this.activeUi) && this.enabled) {
         this.updateUi(ui);
       }
     }
   }
 
   /**
-   * Compatibility hook for message_end.
-   * In OMP, internal retries and fallback chains are cleanly disabled via runtime
-   * settings overrides (retry.enabled: false, retry.modelFallback: false).
-   * We do not append fake "quota exceeded" comments to avoid triggering OMP's
-   * Flag.UsageLimit error classifier.
+   * Optional helper to mark an error message as quota exceeded if external callers request it.
    */
-  handleMessageEnd(_message: PvpAgentMessage): PvpAgentMessage | undefined {
+  handleMessageEnd(message: PvpAgentMessage): PvpAgentMessage | undefined {
+    if (
+      this.enabled &&
+      message &&
+      message.role === "assistant" &&
+      "stopReason" in message &&
+      message.stopReason === "error" &&
+      "errorMessage" in message &&
+      typeof message.errorMessage === "string" &&
+      message.errorMessage.length > 0 &&
+      !message.errorMessage.includes("quota exceeded")
+    ) {
+      return {
+        ...message,
+        errorMessage: `${message.errorMessage} <!-- quota exceeded -->`,
+      };
+    }
     return undefined;
+  }
+
+  /**
+   * Record a retry attempt during native in-place retry.
+   * Increments attempt counter, updates UI, and emits notification.
+   */
+  recordRetryAttempt(ui?: PvpUi, error?: string): number {
+    if (!this.enabled) {
+      return 0;
+    }
+    this.attemptCount++;
+    if (error) {
+      this.lastError = error;
+    }
+    if (ui) {
+      this.activeUi = ui;
+    }
+    this.updateUi(ui);
+    const targetUi = ui ?? this.activeUi;
+    if (targetUi) {
+      targetUi.notify(`PVP: 请求失败，正在无延迟重试 (第 ${this.attemptCount} 次)...`, "info");
+    }
+    return this.attemptCount;
+  }
+
+  /**
+   * Handle turn completion with success.
+   * Resets attempt count to zero.
+   * If in "one" mode, automatically disables PVP and notifies "PVP OFF".
+   */
+  handleSuccess(ui?: PvpUi): void {
+    if (!this.enabled) {
+      return;
+    }
+    this.pendingRetry = false;
+    this.attemptCount = 0;
+    this.retryInFlight = false;
+    this.lastError = undefined;
+
+    if (this.mode === "one") {
+      this.disable(ui);
+      const targetUi = ui ?? this.activeUi;
+      targetUi?.notify("PVP OFF", "info");
+    } else {
+      this.updateUi(ui);
+    }
+  }
+
+  /**
+   * Handle user abort (Ctrl+C).
+   * Resets retry attempt count and restores clean UI.
+   */
+  handleAbort(ui?: PvpUi): void {
+    this.cancelRetry();
+    this.attemptCount = 0;
+    this.lastError = undefined;
+    this.retryInFlight = false;
+    if (this.enabled) {
+      this.updateUi(ui);
+    }
+  }
+
+  /**
+   * Handle submission of a new prompt by the user.
+   * Resets retry count to zero.
+   */
+  handleNewPrompt(ui?: PvpUi): void {
+    if (ui) {
+      this.activeUi = ui;
+    }
+    const hadAttempts = this.attemptCount > 0 || this.lastError !== undefined;
+    this.attemptCount = 0;
+    this.lastError = undefined;
+    if (hadAttempts && this.enabled) {
+      this.updateUi(ui);
+    }
   }
 
   /**
    * Handle turn_end event. Detects failures, successes, and aborts.
    */
-  handleTurnEnd(message: PvpAgentMessage, ui: PvpUi): TurnEndResult {
+  handleTurnEnd(message: PvpAgentMessage, ui?: PvpUi): TurnEndResult {
     if (!this.enabled) {
       return { shouldRetry: false, success: false };
     }
@@ -225,13 +328,9 @@ export class PvpController {
 
     const stopReason = "stopReason" in message ? message.stopReason : undefined;
 
-    // User or system abort: cancel any retry and never retry
+    // User or system abort: cancel any retry and clean up
     if (stopReason === "aborted") {
-      this.cancelRetry();
-      this.attemptCount = 0;
-      this.lastError = undefined;
-      this.retryInFlight = false;
-      this.updateUi(ui);
+      this.handleAbort(ui);
       return { shouldRetry: false, success: false };
     }
 
@@ -248,34 +347,21 @@ export class PvpController {
 
     // Model turn succeeded with final answer (stop) or max length limit
     if (stopReason === "stop" || stopReason === "length") {
-      this.pendingRetry = false;
-      this.attemptCount = 0;
-      this.retryInFlight = false;
-      this.lastError = undefined;
-
-      if (this.mode === "one") {
-        this.disable(ui);
-        ui.notify("PVP OFF", "info");
-      } else {
-        this.updateUi(ui);
-      }
+      this.handleSuccess(ui);
       return { shouldRetry: false, success: true };
     }
 
-    // Intermediate steps like "toolUse" keep PVP active without triggering retry or closing
     return { shouldRetry: false, success: false };
   }
 
   /**
-   * Schedule immediate retry without cooldown when pendingRetry is true.
-   *
-   * Uses setTimeout(..., 0) to yield execution back to the event loop,
-   * ensuring OMP has completely settled before the new message is dispatched.
+   * Schedule retry helper for manual dispatchers or unit tests.
    */
   scheduleRetry(
     sendFn: (prompt: string, images?: PvpImageContent[]) => void,
-    ui: PvpUi
+    ui?: PvpUi
   ): boolean {
+    const targetUi = ui ?? this.activeUi;
     if (!this.enabled || !this.pendingRetry || this.retryTimer !== undefined) {
       return false;
     }
@@ -291,8 +377,10 @@ export class PvpController {
     const promptToRetry = this.lastPrompt;
     const imagesToRetry = this.lastImages ? [...this.lastImages] : undefined;
 
-    this.updateUi(ui);
-    ui.notify(`PVP: 请求失败，正在无延迟重试 (第 ${currentAttempt} 次)...`, "info");
+    this.updateUi(targetUi);
+    if (targetUi) {
+      targetUi.notify(`PVP: 请求失败，正在无延迟重试 (第 ${currentAttempt} 次)...`, "info");
+    }
 
     this.retryTimer = setTimeout(() => {
       this.retryTimer = undefined;
@@ -324,6 +412,7 @@ export class PvpController {
 
   /** Apply the public `/pvp [on|one|off]` command grammar. */
   handleCommand(args: string, ctx: PvpCommandContext): void {
+    this.activeUi = ctx.ui;
     const command = args.trim().toLowerCase();
 
     if (command === "" || command === "on") {
@@ -348,9 +437,161 @@ export class PvpController {
   }
 
   /** Clear state during shutdown or other terminal cleanup paths. */
-  cleanup(ui: PvpUi): void {
+  cleanup(ui?: PvpUi): void {
     this.disable(ui);
   }
+}
+
+let activeHookCleanup: (() => void) | undefined = undefined;
+
+/**
+ * Install the native AgentSession and TurnRecovery prototype retry hooks.
+ *
+ * Supports both Pi core and OMP core:
+ * - Pi core & session prototype: Hooks `_isRetryableError` and `_prepareRetry`
+ *   to perform native in-place retry without chat transcript pollution.
+ * - OMP core: Hooks `TurnRecovery.prototype.isRetryableError` and `handleRetryableError`
+ *   alongside SettingsGuard overrides.
+ */
+export function installPvpRetryHook(controller: PvpController): () => void {
+  activeHookCleanup?.();
+
+  const cleanups: Array<() => void> = [];
+
+  // 1. Hook AgentSession prototype (Pi core & common AgentSession prototype)
+  try {
+    const sessionProto = (AgentSession as any)?.prototype;
+    if (sessionProto) {
+      const origIsRetryable = sessionProto._isRetryableError;
+      const origPrepareRetry = sessionProto._prepareRetry;
+
+      sessionProto._isRetryableError = function (message: any): boolean {
+        if (controller.enabled) {
+          if (message?.stopReason === "aborted") return false;
+          if (origIsRetryable && origIsRetryable.call(this, message)) return true;
+          const errorText = (message?.errorMessage || "").toLowerCase();
+          const isOverflow =
+            errorText.includes("context") &&
+            (errorText.includes("overflow") ||
+              errorText.includes("too long") ||
+              errorText.includes("exceed"));
+          if (isOverflow) return false;
+          if (message?.stopReason === "error") return true;
+        }
+        return origIsRetryable ? origIsRetryable.call(this, message) : false;
+      };
+
+      sessionProto._prepareRetry = async function (message: any): Promise<boolean> {
+        if (controller.enabled) {
+          const self = this as any;
+          const ui = self._extensionUIContext;
+          const error = typeof message?.errorMessage === "string" ? message.errorMessage : undefined;
+          controller.recordRetryAttempt(ui, error);
+
+          // Remove error assistant message from agent state so agent continues in place
+          const messages = self.agent?.state?.messages;
+          if (
+            Array.isArray(messages) &&
+            messages.length > 0 &&
+            messages[messages.length - 1]?.role === "assistant"
+          ) {
+            self.agent.state.messages = messages.slice(0, -1);
+          }
+
+          // Yield immediately to event loop with abort signal check
+          self._retryAbortController = new AbortController();
+          try {
+            await new Promise<void>((resolve, reject) => {
+              const signal = self._retryAbortController?.signal;
+              if (signal?.aborted) return reject(new Error("Aborted"));
+              const timer = setTimeout(resolve, 0);
+              signal?.addEventListener(
+                "abort",
+                () => {
+                  clearTimeout(timer);
+                  reject(new Error("Aborted"));
+                },
+                { once: true }
+              );
+            });
+          } catch {
+            self._retryAttempt = 0;
+            controller.handleAbort(ui);
+            return false;
+          } finally {
+            self._retryAbortController = undefined;
+          }
+
+          return true;
+        }
+        return origPrepareRetry ? origPrepareRetry.call(this, message) : false;
+      };
+
+      cleanups.push(() => {
+        sessionProto._isRetryableError = origIsRetryable;
+        sessionProto._prepareRetry = origPrepareRetry;
+      });
+    }
+  } catch {
+    // Ignore AgentSession hook failure
+  }
+
+  // 2. Hook TurnRecovery prototype if available (OMP runtime)
+  try {
+    import("@oh-my-pi/pi-coding-agent/session/turn-recovery")
+      .then(({ TurnRecovery }) => {
+        if (TurnRecovery && TurnRecovery.prototype) {
+          const proto = TurnRecovery.prototype as any;
+          const origIsRetryable = proto.isRetryableError;
+          const origHandleRetryable = proto.handleRetryableError;
+
+          proto.isRetryableError = function (message: any): boolean {
+            if (controller.enabled) {
+              if (message?.stopReason === "aborted") return false;
+              const errorText = (message?.errorMessage || "").toLowerCase();
+              const isOverflow =
+                errorText.includes("context") &&
+                (errorText.includes("overflow") ||
+                  errorText.includes("too long") ||
+                  errorText.includes("exceed"));
+              if (isOverflow) return false;
+              if (message?.stopReason === "error") return true;
+            }
+            return origIsRetryable ? origIsRetryable.call(this, message) : false;
+          };
+
+          proto.handleRetryableError = async function (message: any, options?: any): Promise<boolean> {
+            if (controller.enabled) {
+              const error = typeof message?.errorMessage === "string" ? message.errorMessage : undefined;
+              controller.recordRetryAttempt(controller.lastUi, error);
+            }
+            return origHandleRetryable ? origHandleRetryable.call(this, message, options) : false;
+          };
+
+          cleanups.push(() => {
+            proto.isRetryableError = origIsRetryable;
+            proto.handleRetryableError = origHandleRetryable;
+          });
+        }
+      })
+      .catch(() => {
+        // Ignore if module not available
+      });
+  } catch {
+    // Ignore
+  }
+
+  const cleanup = () => {
+    for (const c of cleanups) {
+      try {
+        c();
+      } catch {
+        // Ignore
+      }
+    }
+  };
+  activeHookCleanup = cleanup;
+  return cleanup;
 }
 
 export function getPvpArgumentCompletions(prefix: string): Array<{ value: string; label: string }> | null {

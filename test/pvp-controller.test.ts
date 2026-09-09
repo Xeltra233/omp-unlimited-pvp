@@ -2,12 +2,14 @@ import { describe, expect, it, mock } from "bun:test";
 import {
   formatPvpStatus,
   getPvpArgumentCompletions,
+  installPvpRetryHook,
   PvpController,
   PVP_STATUS_KEY,
   PVP_WIDGET_KEY,
   type PvpAgentMessage,
   type PvpUi,
 } from "../src/pvp-controller.js";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent";
 import type { SettingsLike } from "../src/settings-guard.js";
 
 function createMockUi(): PvpUi & {
@@ -76,7 +78,9 @@ describe("PvpController State & Commands", () => {
     expect(controller.enabled).toBe(true);
     expect(controller.isAntiFallbackApplied).toBe(true);
     expect(mockSettings.overrides["retry.modelFallback"]).toBe(false);
-    expect(mockSettings.overrides["retry.enabled"]).toBe(false);
+    expect(mockSettings.overrides["retry.enabled"]).toBe(true);
+    expect(mockSettings.overrides["retry.maxRetries"]).toBe(999999);
+    expect(mockSettings.overrides["retry.baseDelayMs"]).toBe(0);
     expect(mockSettings.overrides["retry.fallbackChains"]).toEqual({});
     expect(ui.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
@@ -100,7 +104,10 @@ describe("PvpController State & Commands", () => {
     expect(controller.enabled).toBe(true);
     expect(controller.isAntiFallbackApplied).toBe(true);
     expect(mockSettings.overrides["retry.modelFallback"]).toBe(false);
-    expect(mockSettings.overrides["retry.enabled"]).toBe(false);
+    expect(mockSettings.overrides["retry.enabled"]).toBe(true);
+    expect(mockSettings.overrides["retry.maxRetries"]).toBe(999999);
+    expect(mockSettings.overrides["retry.baseDelayMs"]).toBe(0);
+    expect(mockSettings.overrides["retry.fallbackChains"]).toEqual({});
     expect(ui.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp one"]);
     expect(ui.widgets[PVP_WIDGET_KEY]?.options).toEqual({ placement: "belowEditor" });
@@ -471,5 +478,127 @@ describe("formatPvpStatus", () => {
     const res = formatPvpStatus("persistent", 2, mockTheme);
     expect(res).toContain("[muted]pvp on[/muted]");
     expect(res).toContain("[dim](第 2 次重试)[/dim]");
+  });
+});
+
+describe("PvpController Native In-Place Retry & Hook Mechanisms", () => {
+  it("recordRetryAttempt increments attempt count and emits notification", () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+    controller.enable("persistent", ui);
+
+    const count1 = controller.recordRetryAttempt(ui, "Connection failed");
+    expect(count1).toBe(1);
+    expect(controller.currentAttempt).toBe(1);
+    expect(controller.lastErrorMessage).toBe("Connection failed");
+    expect(ui.notifications.some((n) => n.msg.includes("第 1 次"))).toBe(true);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 1 次重试)"]);
+
+    const count2 = controller.recordRetryAttempt(ui, "Timeout");
+    expect(count2).toBe(2);
+    expect(controller.currentAttempt).toBe(2);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 2 次重试)"]);
+  });
+
+  it("handleSuccess resets retry count and handles 'one' mode auto-closing", () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+    controller.enable("persistent", ui);
+    controller.recordRetryAttempt(ui, "Err");
+    expect(controller.currentAttempt).toBe(1);
+
+    controller.handleSuccess(ui);
+    expect(controller.currentAttempt).toBe(0);
+    expect(controller.enabled).toBe(true);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
+
+    // One mode
+    controller.enable("one", ui);
+    controller.recordRetryAttempt(ui, "Err");
+    controller.handleSuccess(ui);
+    expect(controller.enabled).toBe(false);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toBeUndefined();
+    expect(ui.notifications.some((n) => n.msg === "PVP OFF")).toBe(true);
+  });
+
+  it("handleAbort resets retry state and restores clean UI", () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+    controller.enable("persistent", ui);
+    controller.recordRetryAttempt(ui, "Err");
+    expect(controller.currentAttempt).toBe(1);
+
+    controller.handleAbort(ui);
+    expect(controller.currentAttempt).toBe(0);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
+  });
+
+  it("handleNewPrompt resets count when user submits fresh prompt", () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+    controller.enable("persistent", ui);
+    controller.recordRetryAttempt(ui, "Err");
+    expect(controller.currentAttempt).toBe(1);
+
+    controller.handleNewPrompt(ui);
+    expect(controller.currentAttempt).toBe(0);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
+  });
+
+  it("handleMessageEnd modifies assistant error messages when enabled", () => {
+    const controller = new PvpController();
+    const errorMsg: PvpAgentMessage = {
+      role: "assistant",
+      content: [],
+      stopReason: "error",
+      errorMessage: "Rate limit exceeded",
+    } as any;
+
+    expect(controller.handleMessageEnd(errorMsg)).toBeUndefined();
+
+    controller.enable("persistent");
+    const replaced = controller.handleMessageEnd(errorMsg);
+    expect(replaced).toBeDefined();
+    expect(replaced?.errorMessage).toBe("Rate limit exceeded <!-- quota exceeded -->");
+  });
+
+  it("installPvpRetryHook hooks AgentSession prototype and cleans up cleanly", async () => {
+    const controller = new PvpController();
+    const ui = createMockUi();
+    controller.enable("persistent", ui);
+
+    const uninstall = installPvpRetryHook(controller);
+    const sessionProto = (AgentSession as any).prototype;
+
+    // Test _isRetryableError
+    expect(sessionProto._isRetryableError({ stopReason: "error", errorMessage: "500" })).toBe(true);
+    expect(sessionProto._isRetryableError({ stopReason: "aborted" })).toBe(false);
+    expect(sessionProto._isRetryableError({ stopReason: "error", errorMessage: "context overflow exceed" })).toBe(false);
+
+    // Test _prepareRetry
+    const fakeSession = {
+      _extensionUIContext: ui,
+      agent: {
+        state: {
+          messages: [
+            { role: "user", content: [{ type: "text", text: "Task" }] },
+            { role: "assistant", stopReason: "error", errorMessage: "500" },
+          ],
+        },
+      },
+    };
+
+    const willRetry = await sessionProto._prepareRetry.call(fakeSession, {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "500",
+    });
+    expect(willRetry).toBe(true);
+    expect(fakeSession.agent.state.messages).toHaveLength(1);
+    expect(controller.currentAttempt).toBe(1);
+
+    // Cleanup restores prototype
+    uninstall();
+    controller.disable(ui);
   });
 });

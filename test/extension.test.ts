@@ -1,9 +1,10 @@
 import { describe, expect, it, mock } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-  ExtensionContext,
+import {
+  AgentSession,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
 import pvpExtension, { PVP_STATUS_KEY, PVP_WIDGET_KEY } from "../src/index.js";
 
@@ -97,6 +98,7 @@ function createMockContext(model?: Model): ExtensionCommandContext & {
     models: {
       current: () => model,
     } as any,
+    scopedModels: [],
     isIdle: () => true,
     isProjectTrusted: () => true,
     signal: undefined,
@@ -106,6 +108,7 @@ function createMockContext(model?: Model): ExtensionCommandContext & {
     getContextUsage: () => undefined,
     compact: mock(async () => {}),
     getSystemPrompt: () => [],
+    getSystemPromptOptions: () => ({ cwd: "/mock/cwd" }),
     waitForIdle: async () => {},
     newSession: mock(async () => ({ cancelled: false })),
     branch: mock(async () => ({ cancelled: false })),
@@ -122,11 +125,10 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     expect(handlers.has("before_agent_start")).toBe(true);
     expect(handlers.has("retry_fallback_applied")).toBe(true);
     expect(handlers.has("turn_end")).toBe(true);
-    expect(handlers.has("agent_end")).toBe(true);
     expect(handlers.has("session_shutdown")).toBe(true);
   });
 
-  it("simulates full persistent retry flow: prompt -> failure -> retry -> failure -> retry -> success -> remains enabled", async () => {
+  it("simulates full persistent retry flow with native in-place retry (never sends user messages)", async () => {
     const { api, handlers, commands, sentMessages } = createMockExtensionApi();
     pvpExtension(api);
 
@@ -155,51 +157,54 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     const beforeAgentStart = handlers.get("before_agent_start")![0];
     beforeAgentStart({ type: "before_agent_start", prompt: "Build a feature", systemPrompt: [] }, ctx);
 
-    // 3. Turn 1 fails
-    const turnEnd = handlers.get("turn_end")![0];
-    const agentEnd = handlers.get("agent_end")![0];
-
-    const errorMsg = {
-      role: "assistant",
-      content: [],
-      stopReason: "error",
-      errorMessage: "HTTP 500 Server Error",
+    // 3. Model turn 1 fails -> native AgentSession._prepareRetry intercepts
+    const sessionProto = (AgentSession as any).prototype;
+    const fakeSession = {
+      _extensionUIContext: ctx.ui,
+      agent: {
+        state: {
+          messages: [
+            { role: "user", content: [{ type: "text", text: "Build a feature" }] },
+            { role: "assistant", stopReason: "error", errorMessage: "HTTP 500 Server Error" },
+          ],
+        },
+      },
     };
 
-    turnEnd({ type: "turn_end", turnIndex: 0, message: errorMsg, toolResults: [] }, ctx);
+    const willRetry1 = await sessionProto._prepareRetry.call(fakeSession, {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "HTTP 500 Server Error",
+    });
 
-    // Agent run ends in OMP with willContinue: false -> schedules immediate retry
-    agentEnd({ type: "agent_end", messages: [], willContinue: false }, ctx);
-
-    await new Promise((resolve) => setTimeout(resolve, 10));
-
-    expect(sentMessages).toHaveLength(1);
-    expect(sentMessages[0].content).toBe("Build a feature");
-    expect(sentMessages[0].options?.deliverAs).toBe("followUp");
-    expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
+    expect(willRetry1).toBe(true);
+    // CRITICAL: NEVER sends a user message into the chat!
+    expect(sentMessages).toHaveLength(0);
+    // Assistant error message must be removed from agent state so it can continue in place
+    expect(fakeSession.agent.state.messages).toHaveLength(1);
+    expect(fakeSession.agent.state.messages[0].role).toBe("user");
+    // UI reflects retry count
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 1 次重试)"]);
 
-    // OMP starts the retried agent run, firing before_agent_start for the retry
-    beforeAgentStart({ type: "before_agent_start", prompt: "Build a feature", systemPrompt: [] }, ctx);
-    // Counter must remain at 1, NOT reset to 0!
-    expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 1 次重试)"]);
+    // 4. Model turn 2 fails again -> native retry 2
+    fakeSession.agent.state.messages.push({
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "HTTP 503 Service Unavailable",
+    });
+    const willRetry2 = await sessionProto._prepareRetry.call(fakeSession, {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "HTTP 503 Service Unavailable",
+    });
 
-    // 4. Turn 2 fails again -> schedules retry 2
-    turnEnd({ type: "turn_end", turnIndex: 1, message: errorMsg, toolResults: [] }, ctx);
-    agentEnd({ type: "agent_end", messages: [], willContinue: false }, ctx);
-
-    await new Promise((resolve) => setTimeout(resolve, 10));
-
-    expect(sentMessages).toHaveLength(2);
-    expect(sentMessages[1].content).toBe("Build a feature");
-    // Must accurately increment to attempt 2!
-    expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 2 次重试)"]);
-
-    // OMP starts retry run 2:
-    beforeAgentStart({ type: "before_agent_start", prompt: "Build a feature", systemPrompt: [] }, ctx);
+    expect(willRetry2).toBe(true);
+    expect(sentMessages).toHaveLength(0);
+    expect(fakeSession.agent.state.messages).toHaveLength(1);
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 2 次重试)"]);
 
     // 5. Turn 3 succeeds!
+    const turnEnd = handlers.get("turn_end")![0];
     const successMsg = {
       role: "assistant",
       content: [{ type: "text", text: "Done!" }],
@@ -210,12 +215,20 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     // Success resets count: widget must return to clean "pvp on" without retry count
     expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
+    // Still zero user messages sent
+    expect(sentMessages).toHaveLength(0);
 
     // 6. Subsequent new prompt failure must restart counting from 1
     beforeAgentStart({ type: "before_agent_start", prompt: "New separate task", systemPrompt: [] }, ctx);
-    turnEnd({ type: "turn_end", turnIndex: 0, message: errorMsg, toolResults: [] }, ctx);
-    agentEnd({ type: "agent_end", messages: [], willContinue: false }, ctx);
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    fakeSession.agent.state.messages = [
+      { role: "user", content: [{ type: "text", text: "New separate task" }] },
+      { role: "assistant", stopReason: "error", errorMessage: "Fail again" },
+    ];
+    await sessionProto._prepareRetry.call(fakeSession, {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "Fail again",
+    });
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 1 次重试)"]);
 
     // 7. Aborting the turn cancels retry and cleans up widget back to "pvp on"
@@ -228,7 +241,7 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
   });
 
-  it("simulates /pvp one flow: failure -> retry -> success -> automatically closes", async () => {
+  it("simulates /pvp one flow: failure -> native in-place retry -> success -> automatically closes", async () => {
     const { api, handlers, commands, sentMessages } = createMockExtensionApi();
     pvpExtension(api);
     const ctx = createMockContext();
@@ -245,27 +258,32 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     const beforeAgentStart = handlers.get("before_agent_start")![0];
     beforeAgentStart({ type: "before_agent_start", prompt: "One shot prompt", systemPrompt: [] }, ctx);
 
-    // 3. Turn fails
-    const turnEnd = handlers.get("turn_end")![0];
-    const agentEnd = handlers.get("agent_end")![0];
-
-    const errorMsg = {
-      role: "assistant",
-      content: [],
-      stopReason: "error",
-      errorMessage: "Network timeout",
+    // 3. Turn fails -> native retry 1
+    const sessionProto = (AgentSession as any).prototype;
+    const fakeSession = {
+      _extensionUIContext: ctx.ui,
+      agent: {
+        state: {
+          messages: [
+            { role: "user", content: [{ type: "text", text: "One shot prompt" }] },
+            { role: "assistant", stopReason: "error", errorMessage: "Network error" },
+          ],
+        },
+      },
     };
 
-    turnEnd({ type: "turn_end", turnIndex: 0, message: errorMsg, toolResults: [] }, ctx);
-    agentEnd({ type: "agent_end", messages: [], willContinue: false }, ctx);
+    const willRetry = await sessionProto._prepareRetry.call(fakeSession, {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "Network error",
+    });
 
-    await new Promise((resolve) => setTimeout(resolve, 10));
-
-    expect(sentMessages).toHaveLength(1);
-    expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
+    expect(willRetry).toBe(true);
+    expect(sentMessages).toHaveLength(0);
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp one (第 1 次重试)"]);
 
     // 4. Retry turn succeeds
+    const turnEnd = handlers.get("turn_end")![0];
     const successMsg = {
       role: "assistant",
       content: [{ type: "text", text: "Success" }],
@@ -277,6 +295,7 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toBeUndefined();
     expect(ctx.notifications.some((n) => n.msg === "PVP OFF")).toBe(true);
+    expect(sentMessages).toHaveLength(0);
   });
 
   it("intercepts OMP retry_fallback_applied and restores original model", async () => {
@@ -319,37 +338,6 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     // Verify user notification and setModel restoration
     expect(ctx.notifications.some((n) => n.msg.includes("检测到模型 Fallback"))).toBe(true);
     expect(setModelMock).toHaveBeenCalledWith(originalModel);
-  });
-
-  it("does not trigger retry when agent_end has willContinue: true", async () => {
-    const { api, handlers, commands, sentMessages } = createMockExtensionApi();
-    pvpExtension(api);
-    const ctx = createMockContext();
-
-    const pvpCmd = commands.get("pvp");
-    await pvpCmd.handler("on", ctx);
-
-    const beforeAgentStart = handlers.get("before_agent_start")![0];
-    beforeAgentStart({ type: "before_agent_start", prompt: "Continuing turn", systemPrompt: [] }, ctx);
-
-    const turnEnd = handlers.get("turn_end")![0];
-    const agentEnd = handlers.get("agent_end")![0];
-
-    const errorMsg = {
-      role: "assistant",
-      content: [],
-      stopReason: "error",
-      errorMessage: "Transient error",
-    };
-
-    turnEnd({ type: "turn_end", turnIndex: 0, message: errorMsg, toolResults: [] }, ctx);
-
-    // agent_end with willContinue: true should NOT schedule retry
-    agentEnd({ type: "agent_end", messages: [], willContinue: true }, ctx);
-
-    await new Promise((resolve) => setTimeout(resolve, 10));
-
-    expect(sentMessages).toHaveLength(0);
   });
 
   it("cleans up on session shutdown", async () => {
