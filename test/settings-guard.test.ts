@@ -20,7 +20,11 @@ describe("SettingsGuard Anti-Fallback", () => {
     expect(applied).toBe(true);
     expect(guard.isApplied).toBe(true);
     expect(overrides["retry.modelFallback"]).toBe(false);
-    expect(overrides["retry.enabled"]).toBe(false);
+    // Native in-place retries require OMP's recovery pipeline to remain enabled.
+    expect(overrides["retry.enabled"]).toBe(true);
+    expect(overrides["retry.maxRetries"]).toBe(999999);
+    expect(overrides["retry.baseDelayMs"]).toBe(0);
+    expect(overrides["retry.maxDelayMs"]).toBe(0);
     expect(overrides["retry.fallbackChains"]).toEqual({});
 
     const cleared = guard.clearAntiFallbackOverrides();

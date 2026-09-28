@@ -2,11 +2,15 @@ import { describe, expect, it, mock } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import {
   AgentSession,
+  Settings,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
 import pvpExtension, { PVP_STATUS_KEY, PVP_WIDGET_KEY } from "../src/index.js";
+
+// Real host settings, isolated from user files; commands require an initialized host.
+await Settings.init({ inMemory: true });
 
 type EventHandler = (event: any, ctx: ExtensionContext) => any;
 

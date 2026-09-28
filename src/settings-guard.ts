@@ -1,4 +1,5 @@
 import { settings } from "@oh-my-pi/pi-coding-agent";
+import { adaptSettings } from "./settings-compat.js";
 
 /**
  * Minimal interface compatible with OMP's Settings instance.
@@ -24,6 +25,11 @@ export class SettingsGuard {
 
   constructor(customSettings?: SettingsLike) {
     this.customSettings = customSettings;
+  }
+
+  /** Resolve the host API before enabling; never silently enable an unprotected mode. */
+  async prepare(): Promise<void> {
+    if (!this.customSettings) this.customSettings = await adaptSettings(settings);
   }
 
   private resolveSettings(): SettingsLike | undefined {

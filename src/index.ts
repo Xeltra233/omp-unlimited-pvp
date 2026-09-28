@@ -27,7 +27,8 @@ import {
  * - `/pvp off`: turns off PVP mode, clears status/widgets, and restores OMP settings.
  */
 export default function pvpExtension(pi: ExtensionAPI): void {
-  const controller = new PvpController();
+  const guard = new SettingsGuard();
+  const controller = new PvpController(guard);
   const uninstallHook = installPvpRetryHook(controller);
   let originalModel: Model | undefined = undefined;
 
@@ -35,6 +36,19 @@ export default function pvpExtension(pi: ExtensionAPI): void {
     description: "Enable resident or one-success unlimited retry mode (/pvp, /pvp on, /pvp one, /pvp off)",
     getArgumentCompletions: getPvpArgumentCompletions,
     handler: async (args, ctx) => {
+      if (["", "on", "one"].includes(args.trim().toLowerCase())) {
+        try {
+          await uninstallHook.ready;
+          await guard.prepare();
+          if (!guard.applyAntiFallbackOverrides()) {
+            ctx.ui.notify("PVP: 当前 OMP 的重试设置覆盖失败，未开启。", "error");
+            return;
+          }
+        } catch (error) {
+          ctx.ui.notify(`PVP: 设置兼容层初始化失败：${String(error)}`, "error");
+          return;
+        }
+      }
       controller.handleCommand(args, ctx);
     },
   });

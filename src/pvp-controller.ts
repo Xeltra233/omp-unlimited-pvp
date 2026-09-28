@@ -453,10 +453,12 @@ let activeHookCleanup: (() => void) | undefined = undefined;
  * - OMP core: Hooks `TurnRecovery.prototype.isRetryableError` and `handleRetryableError`
  *   alongside SettingsGuard overrides.
  */
-export function installPvpRetryHook(controller: PvpController): () => void {
+export function installPvpRetryHook(controller: PvpController): (() => void) & { ready: Promise<void> } {
   activeHookCleanup?.();
 
   const cleanups: Array<() => void> = [];
+  let disposed = false;
+  let ready: Promise<void> = Promise.resolve();
 
   // 1. Hook AgentSession prototype (Pi core & common AgentSession prototype)
   try {
@@ -538,8 +540,9 @@ export function installPvpRetryHook(controller: PvpController): () => void {
 
   // 2. Hook TurnRecovery prototype if available (OMP runtime)
   try {
-    import("@oh-my-pi/pi-coding-agent/session/turn-recovery")
+    ready = import("@oh-my-pi/pi-coding-agent/session/turn-recovery")
       .then(({ TurnRecovery }) => {
+        if (disposed) return;
         if (TurnRecovery && TurnRecovery.prototype) {
           const proto = TurnRecovery.prototype as any;
           const origIsRetryable = proto.isRetryableError;
@@ -564,6 +567,7 @@ export function installPvpRetryHook(controller: PvpController): () => void {
             if (controller.enabled) {
               const error = typeof message?.errorMessage === "string" ? message.errorMessage : undefined;
               controller.recordRetryAttempt(controller.lastUi, error);
+              options = { ...options, allowModelFallback: false, fireworksFastFallback: false, hardErrorFallback: false };
             }
             return origHandleRetryable ? origHandleRetryable.call(this, message, options) : false;
           };
@@ -574,14 +578,18 @@ export function installPvpRetryHook(controller: PvpController): () => void {
           });
         }
       })
-      .catch(() => {
-        // Ignore if module not available
+      .catch((error) => {
+        throw new Error(`PVP: OMP retry hook unavailable: ${String(error)}`);
       });
+    // The command awaits readiness; attach a handler for shutdown-before-command.
+    void ready.catch(() => {});
   } catch {
     // Ignore
   }
 
   const cleanup = () => {
+    if (disposed) return;
+    disposed = true;
     for (const c of cleanups) {
       try {
         c();
@@ -591,7 +599,7 @@ export function installPvpRetryHook(controller: PvpController): () => void {
     }
   };
   activeHookCleanup = cleanup;
-  return cleanup;
+  return Object.assign(cleanup, { ready });
 }
 
 export function getPvpArgumentCompletions(prefix: string): Array<{ value: string; label: string }> | null {

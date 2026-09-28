@@ -2,7 +2,18 @@
 
 Unlimited automatic retry plugin specifically crafted for **oh-my-pi (OMP)** with anti-fallback model locking and zero-cooldown scheduling.
 
-By entering `/pvp` in OMP, you can activate the unlimited retry mode: on model or network request failure, it will **retry infinitely without cooldown** (0-delay dispatch), **without default retry limits**, and **strictly lock the selected model without triggering OMP's model fallback / downgrade chains**, until the request succeeds or the user aborts.
+Enter `/pvp` to raise the native retry budget, disable base backoff and model fallback chains, and retry in place until success, user cancellation, or termination by OMP's native recovery logic. See the implementation limits below.
+
+## Compatibility (v0.2.1)
+
+Individually verified **29 releases**: **18.1.14–18.1.22, 18.2.0–18.2.11, 18.3.0–18.3.5, 18.4.0–18.4.1**. The original lockfile pinned 18.1.14, now the verified compatibility floor. Earlier and future versions are not verified.
+
+The plugin detects the legacy settings API or modern `config/registry` handles, awaits hook initialization before enabling, reports initialization failures, and prevents deferred imports from reinstalling hooks after teardown.
+
+Verification runs real OMP SDK sessions with a synthetic local provider stream: six consecutive 503 failures followed by success, one-shot mode, abort, unchanged model, and no duplicate user prompts. This does not cover external providers or visual TUI validation.
+
+**Limits:** the retry budget is `999999`, not mathematical infinity. Ordinary 503 base backoff is zero; provider Retry-After, quota waits and context recovery remain governed by OMP. Not every error can be retried forever without delay.
+
 
 ---
 
@@ -11,7 +22,7 @@ By entering `/pvp` in OMP, you can activate the unlimited retry mode: on model o
 - ⚡ **Zero-Cooldown Immediate Retry**: Completely bypasses OMP's built-in exponential backoff delays (2s, 4s, 8s, etc.), re-dispatching immediately after turn settle.
 - ♾️ **Unlimited Retries**: Removes OMP's default retry limit, continuously retrying until success.
 - 🛡️ **Native Anti-Fallback Protection**:
-  - **Dynamic Runtime Overrides**: When PVP is enabled, OMP's native `Settings.override` is invoked to temporarily set `retry.modelFallback = false`, `retry.enabled = false`, and clear `retry.fallbackChains`.
+  - **Dynamic Runtime Overrides**: Uses legacy `Settings.override` or modern setting-registry handles. Disables `retry.modelFallback`, clears `retry.fallbackChains`, and keeps `retry.enabled = true` for native in-place recovery.
   - **Model Locking & Restoration**: Snapshots the active model on agent start. If any unexpected `retry_fallback_applied` event is detected, it alerts the UI and forcibly switches back via `pi.setModel`.
   - **Clean In-Memory Operation**: All overrides are cleared in memory upon disabling PVP or session shutdown (`session_shutdown`), leaving user configuration files untouched.
   - **No Error Message Pollution**: Avoids injecting dummy `"quota exceeded"` markers that would otherwise trigger OMP's `Flag.UsageLimit` and lock API credentials.
