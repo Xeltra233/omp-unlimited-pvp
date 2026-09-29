@@ -24,6 +24,7 @@ assert.equal(extensionsResult.errors.length, 0);
 assert(session.extensionRunner?.getCommand("pvp"), "extension really loaded");
 let attempts = 0;
 let failures = 6;
+let errorText = "503 Service unavailable";
 let abortOnRetry = false;
 let aborted: Promise<void> | undefined;
 const events: string[] = [];
@@ -47,7 +48,7 @@ session.agent.streamFn = () => {
     const message: any = {
       role: "assistant", content: failed ? [] : [{ type: "text", text: "fixture ok" }],
       api: model.api, provider: model.provider, model: model.id,
-      stopReason: failed ? "error" : "stop", errorMessage: failed ? "503 Service unavailable" : undefined,
+      stopReason: failed ? "error" : "stop", errorMessage: failed ? errorText : undefined,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, timestamp: Date.now(),
     };
@@ -70,13 +71,20 @@ try {
   assert(!events.includes("retry_fallback_applied"));
   assert.equal(session.model?.id, model.id);
 
-  await session.prompt("/pvp one");
-  attempts = 0; failures = 2;
+  await session.prompt("/pvp 1");
+  attempts = 0; failures = 2; errorText = "Upstream stream disconnected";
   await session.prompt("one fixture");
   await session.waitForIdle();
-  assert.equal(attempts, 3);
+  assert.equal(attempts, 3, "upstream stream disconnect is retried in place");
   assert.equal(users(), 2);
-  assert.equal(adapter.get?.("retry.maxRetries"), baseline, "one mode restores retry settings");
+  assert.equal(adapter.get?.("retry.maxRetries"), baseline, "limited mode restores retry settings after the target success");
+
+  await session.prompt("/pvp 2");
+  attempts = 0; failures = 0; errorText = "503 Service unavailable";
+  await session.prompt("target fixture");
+  await session.waitForIdle();
+  assert.equal(attempts, 1, "no retry needed when the request succeeds");
+  assert.equal(adapter.get?.("retry.maxRetries"), 999999, "limited mode stays on until n successes");
 
   await session.prompt("/pvp on");
   attempts = 0; failures = 20; abortOnRetry = true;
@@ -89,7 +97,7 @@ try {
   assert.equal(attempts, stoppedAt, "no retry after abort");
   await session.prompt("/pvp off");
   assert.equal(adapter.get?.("retry.maxRetries"), baseline);
-  assert.equal(users(), 3);
+  assert.equal(users(), 4);
   await session.prompt("/pvp on");
   console.log(JSON.stringify({ result: "PASS", persistentAttempts: 7, oneAttempts: 3,
     abortAttempts: attempts, userMessages: users(), model: session.model?.id, retryDelays: delays }));

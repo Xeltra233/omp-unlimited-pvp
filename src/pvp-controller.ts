@@ -11,7 +11,7 @@ export { SettingsGuard, type SettingsLike };
 
 export const PVP_STATUS_KEY = "omp-unlimited-pvp";
 export const PVP_WIDGET_KEY = "omp-unlimited-pvp";
-export type PvpMode = "off" | "persistent" | "one";
+export type PvpMode = "off" | "persistent" | "limited";
 
 export type PvpAgentMessage = TurnEndEvent["message"];
 export type PvpImageContent = ImageContent;
@@ -22,7 +22,7 @@ export type PvpUi = Pick<ExtensionUIContext, "notify" | "setStatus"> & {
 };
 export type PvpCommandContext = Pick<ExtensionCommandContext, "ui">;
 
-const COMMAND_MODES = ["on", "one", "off"] as const;
+const COMMAND_MODES = ["on", "off"] as const;
 
 export interface TurnEndResult {
   shouldRetry: boolean;
@@ -31,22 +31,26 @@ export interface TurnEndResult {
 
 /**
  * Format status indicator text conforming to OMP native TUI styling.
- * Uses native theme muted/dim colors, clean lowercase text ('pvp on' / 'pvp one'),
+ * Uses native theme muted/dim colors, clean lowercase text ('pvp on' / 'pvp <n>'),
  * matching the exact font size, baseline, and gray tone of native status bar items.
  */
 export function formatPvpStatus(
   mode: Exclude<PvpMode, "off">,
   attemptCount: number = 0,
-  theme?: ExtensionUIContext["theme"]
+  theme?: ExtensionUIContext["theme"],
+  successTarget?: number,
+  successCount: number = 0
 ): string {
-  const isOne = mode === "one";
-  const label = isOne ? "pvp one" : "pvp on";
+  const label = mode === "persistent" ? "pvp on" : `pvp ${successTarget ?? 0}`;
 
   const fg = (color: "accent" | "warning" | "muted" | "dim", text: string): string => {
     return theme ? theme.fg(color as any, text) : text;
   };
 
   let status = fg("muted", label);
+  if (mode === "limited" && successCount > 0) {
+    status += ` ${fg("dim", `(${successCount}/${successTarget ?? 0})`)}`;
+  }
   if (attemptCount > 0) {
     status += ` ${fg("dim", `(第 ${attemptCount} 次重试)`)}`;
   }
@@ -58,14 +62,16 @@ export function formatPvpStatus(
  * and OMP anti-fallback protection.
  *
  * Supported modes:
- * - "persistent": /pvp or /pvp on. Retries infinitely without cooldown upon failure,
+ * - "persistent": /pvp or /pvp on. Reconnects without cooldown upon failure with no limit,
  *   disables OMP model fallback, and remains enabled even after success until manually turned off.
- * - "one": /pvp one. Retries infinitely without cooldown upon failure, and automatically
- *   turns off and restores OMP settings when the model response succeeds.
+ * - "limited": /pvp <n>. Reconnects without cooldown upon failure and automatically turns off
+ *   after n successful turns (failures never consume the target), restoring OMP settings.
  * - "off": disabled, no retries, status bar hidden, original OMP settings active.
  */
 export class PvpController {
   private mode: PvpMode = "off";
+  private successTarget: number | undefined = undefined;
+  private successCount: number = 0;
   private lastPrompt: string | undefined = undefined;
   private lastImages: PvpImageContent[] | undefined = undefined;
   private pendingRetry: boolean = false;
@@ -86,6 +92,16 @@ export class PvpController {
 
   get currentMode(): PvpMode {
     return this.mode;
+  }
+
+  /** Success target configured by /pvp <n>; undefined in persistent mode. */
+  get currentSuccessTarget(): number | undefined {
+    return this.successTarget;
+  }
+
+  /** Successful turns credited toward the target while in limited mode. */
+  get currentSuccessCount(): number {
+    return this.successCount;
   }
 
   get enabled(): boolean {
@@ -144,7 +160,13 @@ export class PvpController {
       return;
     }
 
-    const styledText = formatPvpStatus(this.mode, this.attemptCount, targetUi.theme);
+    const styledText = formatPvpStatus(
+      this.mode,
+      this.attemptCount,
+      targetUi.theme,
+      this.successTarget,
+      this.successCount
+    );
     if (typeof targetUi.setWidget === "function") {
       // In OMP, statusLine renders hookStatuses in statusHost directly adjacent to hookWidgetContainerBelow.
       // Calling both setStatus and setWidget causes OMP to render duplicate "pvp on" lines.
@@ -152,11 +174,13 @@ export class PvpController {
       targetUi.setStatus(PVP_STATUS_KEY, undefined);
       const mode = this.mode;
       const attemptCount = this.attemptCount;
+      const successTarget = this.successTarget;
+      const successCount = this.successCount;
       targetUi.setWidget(
         PVP_WIDGET_KEY,
         (_tui, theme) => ({
           render(_width: number): string[] {
-            return [formatPvpStatus(mode, attemptCount, theme)];
+            return [formatPvpStatus(mode, attemptCount, theme, successTarget, successCount)];
           },
           invalidate(): void {},
         }),
@@ -167,10 +191,12 @@ export class PvpController {
     }
   }
 
-  /** Enable resident mode or one-success mode with anti-fallback protection. */
-  enable(mode: Exclude<PvpMode, "off">, ui?: PvpUi): void {
+  /** Enable persistent mode (unlimited) or limited mode (auto-off after n successful turns), with anti-fallback protection. */
+  enable(mode: Exclude<PvpMode, "off">, ui?: PvpUi, successTarget?: number): void {
     this.cancelRetry();
     this.mode = mode;
+    this.successTarget = mode === "limited" ? successTarget : undefined;
+    this.successCount = 0;
     this.attemptCount = 0;
     this.retryInFlight = false;
     this.lastError = undefined;
@@ -185,6 +211,8 @@ export class PvpController {
   disable(ui?: PvpUi): void {
     this.cancelRetry();
     this.mode = "off";
+    this.successTarget = undefined;
+    this.successCount = 0;
     this.lastPrompt = undefined;
     this.lastImages = undefined;
     this.attemptCount = 0;
@@ -262,9 +290,10 @@ export class PvpController {
   }
 
   /**
+  /**
    * Handle turn completion with success.
-   * Resets attempt count to zero.
-   * If in "one" mode, automatically disables PVP and notifies "PVP OFF".
+   * Resets the retry attempt counter, credits one success in limited mode, and
+   * automatically disables PVP once the configured success target is reached.
    */
   handleSuccess(ui?: PvpUi): void {
     if (!this.enabled) {
@@ -275,13 +304,17 @@ export class PvpController {
     this.retryInFlight = false;
     this.lastError = undefined;
 
-    if (this.mode === "one") {
-      this.disable(ui);
-      const targetUi = ui ?? this.activeUi;
-      targetUi?.notify("PVP OFF", "info");
-    } else {
-      this.updateUi(ui);
+    if (this.mode === "limited") {
+      this.successCount++;
+      if (this.successTarget !== undefined && this.successCount >= this.successTarget) {
+        const completed = this.successCount;
+        this.disable(ui);
+        const targetUi = ui ?? this.activeUi;
+        targetUi?.notify(`PVP OFF (已达 ${completed} 次成功)`, "info");
+        return;
+      }
     }
+    this.updateUi(ui);
   }
 
   /**
@@ -410,7 +443,7 @@ export class PvpController {
     this.retryInFlight = false;
   }
 
-  /** Apply the public `/pvp [on|one|off]` command grammar. */
+  /** Apply the public `/pvp [on|off|<n>]` command grammar. */
   handleCommand(args: string, ctx: PvpCommandContext): void {
     this.activeUi = ctx.ui;
     const command = args.trim().toLowerCase();
@@ -421,10 +454,13 @@ export class PvpController {
       return;
     }
 
-    if (command === "one") {
-      this.enable("one", ctx.ui);
-      ctx.ui.notify("PVP ONE", "info");
-      return;
+    if (/^\d+$/.test(command)) {
+      const target = Number(command);
+      if (Number.isSafeInteger(target) && target >= 1) {
+        this.enable("limited", ctx.ui, target);
+        ctx.ui.notify(`PVP ${target}`, "info");
+        return;
+      }
     }
 
     if (command === "off") {
@@ -433,7 +469,7 @@ export class PvpController {
       return;
     }
 
-    ctx.ui.notify("用法：/pvp、/pvp on、/pvp one 或 /pvp off", "warning");
+    ctx.ui.notify("用法：/pvp、/pvp on、/pvp <n>（n 次成功后自动关闭）或 /pvp off", "warning");
   }
 
   /** Clear state during shutdown or other terminal cleanup paths. */

@@ -94,13 +94,15 @@ describe("PvpController State & Commands", () => {
     expect(ui.notifications[1]?.msg).toBe("PVP ON");
   });
 
-  it("handles '/pvp one' to enable one-success mode with anti-fallback", () => {
+  it("handles '/pvp 3' to enable limited mode with anti-fallback", () => {
     const mockSettings = createMockSettings();
     const controller = new PvpController(mockSettings);
     const ui = createMockUi();
 
-    controller.handleCommand("one", { ui });
-    expect(controller.currentMode).toBe("one");
+    controller.handleCommand("3", { ui });
+    expect(controller.currentMode).toBe("limited");
+    expect(controller.currentSuccessTarget).toBe(3);
+    expect(controller.currentSuccessCount).toBe(0);
     expect(controller.enabled).toBe(true);
     expect(controller.isAntiFallbackApplied).toBe(true);
     expect(mockSettings.overrides["retry.modelFallback"]).toBe(false);
@@ -109,9 +111,9 @@ describe("PvpController State & Commands", () => {
     expect(mockSettings.overrides["retry.baseDelayMs"]).toBe(0);
     expect(mockSettings.overrides["retry.fallbackChains"]).toEqual({});
     expect(ui.statuses[PVP_STATUS_KEY]).toBeUndefined();
-    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp one"]);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp 3"]);
     expect(ui.widgets[PVP_WIDGET_KEY]?.options).toEqual({ placement: "belowEditor" });
-    expect(ui.notifications[0]?.msg).toBe("PVP ONE");
+    expect(ui.notifications[0]?.msg).toBe("PVP 3");
   });
 
   it("handles '/pvp off' to disable, clear UI, and restore OMP fallback settings", () => {
@@ -163,17 +165,14 @@ describe("PvpController State & Commands", () => {
   it("provides argument completions correctly", () => {
     expect(getPvpArgumentCompletions("")).toEqual([
       { value: "on", label: "on" },
-      { value: "one", label: "one" },
       { value: "off", label: "off" },
     ]);
     expect(getPvpArgumentCompletions("o")).toEqual([
       { value: "on", label: "on" },
-      { value: "one", label: "one" },
       { value: "off", label: "off" },
     ]);
     expect(getPvpArgumentCompletions("on")).toEqual([
       { value: "on", label: "on" },
-      { value: "one", label: "one" },
     ]);
     expect(getPvpArgumentCompletions("of")).toEqual([
       { value: "off", label: "off" },
@@ -254,11 +253,11 @@ describe("PvpController Turn Outcomes & Retries", () => {
     expect(sentPrompt).toBe("Retry prompt");
   });
 
-  it("clears pending retry and turns off in 'one' mode upon success", () => {
+  it("clears pending retry and turns off in limited mode after the n-th success", () => {
     const mockSettings = createMockSettings();
     const controller = new PvpController(mockSettings);
     const ui = createMockUi();
-    controller.enable("one", ui);
+    controller.enable("limited", ui, 1);
     expect(controller.isAntiFallbackApplied).toBe(true);
 
     const successMessage: PvpAgentMessage = {
@@ -279,7 +278,7 @@ describe("PvpController Turn Outcomes & Retries", () => {
     expect(controller.enabled).toBe(false);
     expect(controller.isAntiFallbackApplied).toBe(false);
     expect(mockSettings.overrides["retry.modelFallback"]).toBeUndefined();
-    expect(ui.notifications.some((n) => n.msg === "PVP OFF")).toBe(true);
+    expect(ui.notifications.some((n) => n.msg.includes("PVP OFF"))).toBe(true);
   });
 
   it("cancels retry on user abort", () => {
@@ -465,7 +464,8 @@ describe("PvpController Turn Outcomes & Retries", () => {
 describe("formatPvpStatus", () => {
   it("formats status string with and without attempts", () => {
     expect(formatPvpStatus("persistent", 0)).toBe("pvp on");
-    expect(formatPvpStatus("one", 0)).toBe("pvp one");
+    expect(formatPvpStatus("limited", 0, undefined, 3)).toBe("pvp 3");
+    expect(formatPvpStatus("limited", 0, undefined, 3, 1)).toBe("pvp 3 (1/3)");
     expect(formatPvpStatus("persistent", 3)).toContain("pvp on");
     expect(formatPvpStatus("persistent", 3)).toContain("(第 3 次重试)");
   });
@@ -500,7 +500,7 @@ describe("PvpController Native In-Place Retry & Hook Mechanisms", () => {
     expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 2 次重试)"]);
   });
 
-  it("handleSuccess resets retry count and handles 'one' mode auto-closing", () => {
+  it("handleSuccess resets retry count and counts successes in limited mode", () => {
     const controller = new PvpController();
     const ui = createMockUi();
     controller.enable("persistent", ui);
@@ -512,13 +512,18 @@ describe("PvpController Native In-Place Retry & Hook Mechanisms", () => {
     expect(controller.enabled).toBe(true);
     expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
 
-    // One mode
-    controller.enable("one", ui);
+    // Limited mode: failures never consume the target; the n-th success closes it
+    controller.enable("limited", ui, 2);
     controller.recordRetryAttempt(ui, "Err");
+    controller.handleSuccess(ui);
+    expect(controller.enabled).toBe(true);
+    expect(controller.currentSuccessCount).toBe(1);
+    expect(ui.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp 2 (1/2)"]);
+
     controller.handleSuccess(ui);
     expect(controller.enabled).toBe(false);
     expect(ui.widgets[PVP_WIDGET_KEY]?.content).toBeUndefined();
-    expect(ui.notifications.some((n) => n.msg === "PVP OFF")).toBe(true);
+    expect(ui.notifications.some((n) => n.msg.includes("PVP OFF"))).toBe(true);
   });
 
   it("handleAbort resets retry state and restores clean UI", () => {

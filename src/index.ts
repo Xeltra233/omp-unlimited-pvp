@@ -23,7 +23,7 @@ import {
  * Provides unlimited automatic retry mode for OMP (Oh My Pi) without cooldown,
  * without default retry count limits, and without triggering OMP's model fallback mode:
  * - `/pvp` or `/pvp on`: enables resident (persistent) PVP mode.
- * - `/pvp one`: enables one-success PVP mode (automatically turns off upon success).
+ * - `/pvp <n>`: enables limited PVP mode (automatically turns off after n successful turns).
  * - `/pvp off`: turns off PVP mode, clears status/widgets, and restores OMP settings.
  */
 export default function pvpExtension(pi: ExtensionAPI): void {
@@ -33,10 +33,11 @@ export default function pvpExtension(pi: ExtensionAPI): void {
   let originalModel: Model | undefined = undefined;
 
   pi.registerCommand("pvp", {
-    description: "Enable resident or one-success unlimited retry mode (/pvp, /pvp on, /pvp one, /pvp off)",
+    description: "Enable resident retry mode (/pvp, /pvp on) or auto-off after n successes (/pvp <n>); disable with /pvp off",
     getArgumentCompletions: getPvpArgumentCompletions,
     handler: async (args, ctx) => {
-      if (["", "on", "one"].includes(args.trim().toLowerCase())) {
+      const command = args.trim().toLowerCase();
+      if (command === "" || command === "on" || /^\d+$/.test(command)) {
         try {
           await uninstallHook.ready;
           await guard.prepare();

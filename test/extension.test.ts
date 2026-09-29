@@ -245,18 +245,18 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
   });
 
-  it("simulates /pvp one flow: failure -> native in-place retry -> success -> automatically closes", async () => {
+  it("simulates /pvp 2 flow: failure -> retry -> first success keeps mode, second success closes it", async () => {
     const { api, handlers, commands, sentMessages } = createMockExtensionApi();
     pvpExtension(api);
     const ctx = createMockContext();
 
-    // 1. User enters /pvp one
+    // 1. User enters /pvp 2
     const pvpCmd = commands.get("pvp");
-    await pvpCmd.handler("one", ctx);
+    await pvpCmd.handler("2", ctx);
     expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
-    expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp one"]);
+    expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp 2"]);
     expect(ctx.widgets[PVP_WIDGET_KEY]?.options).toEqual({ placement: "belowEditor" });
-    expect(ctx.notifications[0]?.msg).toBe("PVP ONE");
+    expect(ctx.notifications[0]?.msg).toBe("PVP 2");
 
     // 2. User submits prompt
     const beforeAgentStart = handlers.get("before_agent_start")![0];
@@ -284,7 +284,7 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
 
     expect(willRetry).toBe(true);
     expect(sentMessages).toHaveLength(0);
-    expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp one (第 1 次重试)"]);
+    expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp 2 (第 1 次重试)"]);
 
     // 4. Retry turn succeeds
     const turnEnd = handlers.get("turn_end")![0];
@@ -295,10 +295,15 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     };
     turnEnd({ type: "turn_end", turnIndex: 1, message: successMsg, toolResults: [] }, ctx);
 
-    // Status bar and widget must be cleared automatically
+    // First success keeps the mode on and credits 1/2
+    expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
+    expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp 2 (1/2)"]);
+
+    // 5. Second success reaches the target and closes the mode
+    turnEnd({ type: "turn_end", turnIndex: 2, message: successMsg, toolResults: [] }, ctx);
     expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toBeUndefined();
-    expect(ctx.notifications.some((n) => n.msg === "PVP OFF")).toBe(true);
+    expect(ctx.notifications.some((n) => n.msg.includes("PVP OFF"))).toBe(true);
     expect(sentMessages).toHaveLength(0);
   });
 
