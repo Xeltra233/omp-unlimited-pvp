@@ -13,8 +13,9 @@ export interface SettingsLike {
 /**
  * Manages runtime settings overrides to prevent OMP from:
  * 1. Triggering fallback model chains upon error (`retry.modelFallback = false`)
- * 2. Engaging internal backoff delays/retries (`retry.enabled = false`)
+ * 2. Engaging internal backoff delays (`retry.baseDelayMs`/`retry.maxDelayMs = 0`)
  * 3. Selecting alternative model candidates (`retry.fallbackChains = {}`)
+ * 4. Capping retries (`retry.enabled = true`, `retry.maxRetries = 999999`)
  *
  * Overrides are purely in-memory runtime overlays and are cleanly restored
  * whenever PVP mode is turned off or the session shuts down.
@@ -27,14 +28,29 @@ export class SettingsGuard {
     this.customSettings = customSettings;
   }
 
-  /** Resolve the host API before enabling; never silently enable an unprotected mode. */
+  /** Resolve the host API before enabling so overrides target the live settings instance. */
   async prepare(): Promise<void> {
-    if (!this.customSettings) this.customSettings = await adaptSettings(settings);
+    if (this.customSettings) return;
+    try {
+      this.customSettings = await adaptSettings(settings);
+    } catch (error) {
+      // Hook-only mode: the controller's session_stop continuation still guarantees
+      // retries, so a settings adapter failure must not block enabling.
+      this.prepareError = error instanceof Error ? error.message : String(error);
+    }
   }
+
+  /** Why the settings adapter could not be resolved, when it could not. */
+  prepareError: string | undefined = undefined;
+  /** Why the runtime overrides could not be written, when they could not. */
+  overrideError: string | undefined = undefined;
 
   private resolveSettings(): SettingsLike | undefined {
     if (this.customSettings) {
       return this.customSettings;
+    }
+    if (this.prepareError !== undefined) {
+      return undefined;
     }
     try {
       return settings as unknown as SettingsLike;
@@ -65,7 +81,8 @@ export class SettingsGuard {
       s.override("retry.maxDelayMs", 0);
       this.overridesApplied = true;
       return true;
-    } catch {
+    } catch (error) {
+      this.overrideError = error instanceof Error ? error.message : String(error);
       return false;
     }
   }

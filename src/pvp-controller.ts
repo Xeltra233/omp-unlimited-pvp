@@ -24,11 +24,43 @@ export type PvpCommandContext = Pick<ExtensionCommandContext, "ui">;
 
 const COMMAND_MODES = ["on", "off"] as const;
 
+/** Custom message type used when PVP has to restart a turn the host already settled. */
+export const PVP_RETRY_MESSAGE_TYPE = "pvp-auto-retry";
+
+const PVP_CONTINUATION_TAG = "<pvp-auto-retry>";
+
 export interface TurnEndResult {
   shouldRetry: boolean;
   success: boolean;
 }
 
+/** Continuation instruction handed to OMP's `session_stop` hook when the host gives up on a failed turn. */
+export interface PvpContinuation {
+  reason: string;
+}
+
+/**
+ * Aborts and context overflows must keep the host's own handling: PVP never
+ * retries them, so both the prototype hook and the `session_stop` continuation
+ * stay out of the way.
+ */
+export function isPvpNonRetryableMessage(message: PvpAgentMessage | undefined): boolean {
+  if (!message) return true;
+  const stopReason = "stopReason" in message ? message.stopReason : undefined;
+  if (stopReason === "aborted") return true;
+  const raw = "errorMessage" in message ? message.errorMessage : undefined;
+  const errorText = (typeof raw === "string" ? raw : "").toLowerCase();
+  return (
+    errorText.includes("context") &&
+    (errorText.includes("overflow") || errorText.includes("too long") || errorText.includes("exceed"))
+  );
+}
+
+function readErrorMessage(message: PvpAgentMessage | undefined): string {
+  if (!message || !("errorMessage" in message)) return "Unknown error";
+  const raw = message.errorMessage;
+  return typeof raw === "string" && raw.length > 0 ? raw : "Unknown error";
+}
 /**
  * Format status indicator text conforming to OMP native TUI styling.
  * Uses native theme muted/dim colors, clean lowercase text ('pvp on' / 'pvp <n>'),
@@ -472,6 +504,38 @@ export class PvpController {
     ctx.ui.notify("用法：/pvp、/pvp on、/pvp <n>（n 次成功后自动关闭）或 /pvp off", "warning");
   }
 
+  /**
+   * Host gave up on a failed turn and is settling the session. Returning a
+   * continuation keeps PVP's unlimited-retry contract when OMP's own retry
+   * saga ends before the prototype hook is consulted (hard-error fallback,
+   * budget backstop, or any future bypass).
+   */
+  handleSessionStop(message: PvpAgentMessage | undefined, ui?: PvpUi): PvpContinuation | undefined {
+    if (!this.enabled) return undefined;
+    if (!message || message.role !== "assistant") return undefined;
+    const stopReason = "stopReason" in message ? message.stopReason : undefined;
+    if (stopReason !== "error") return undefined;
+    if (isPvpNonRetryableMessage(message)) return undefined;
+
+    const error = readErrorMessage(message);
+    this.pendingRetry = false;
+    this.retryInFlight = false;
+    this.recordRetryAttempt(ui ?? this.activeUi, error);
+    return {
+      reason: `${PVP_CONTINUATION_TAG} 上一次请求失败：${error}。继续完成被打断的任务，不要复述这条错误。`,
+    };
+  }
+
+  /**
+   * True when the last settled turn failed and PVP still owns a retry for it.
+   * Clears the flag so only one dispatcher can claim the retry.
+   */
+  consumePendingRetry(): boolean {
+    if (!this.pendingRetry) return false;
+    this.pendingRetry = false;
+    return true;
+  }
+
   /** Clear state during shutdown or other terminal cleanup paths. */
   cleanup(ui?: PvpUi): void {
     this.disable(ui);
@@ -505,15 +569,8 @@ export function installPvpRetryHook(controller: PvpController): (() => void) & {
 
       sessionProto._isRetryableError = function (message: any): boolean {
         if (controller.enabled) {
-          if (message?.stopReason === "aborted") return false;
           if (origIsRetryable && origIsRetryable.call(this, message)) return true;
-          const errorText = (message?.errorMessage || "").toLowerCase();
-          const isOverflow =
-            errorText.includes("context") &&
-            (errorText.includes("overflow") ||
-              errorText.includes("too long") ||
-              errorText.includes("exceed"));
-          if (isOverflow) return false;
+          if (isPvpNonRetryableMessage(message)) return false;
           if (message?.stopReason === "error") return true;
         }
         return origIsRetryable ? origIsRetryable.call(this, message) : false;
@@ -586,14 +643,7 @@ export function installPvpRetryHook(controller: PvpController): (() => void) & {
 
           proto.isRetryableError = function (message: any): boolean {
             if (controller.enabled) {
-              if (message?.stopReason === "aborted") return false;
-              const errorText = (message?.errorMessage || "").toLowerCase();
-              const isOverflow =
-                errorText.includes("context") &&
-                (errorText.includes("overflow") ||
-                  errorText.includes("too long") ||
-                  errorText.includes("exceed"));
-              if (isOverflow) return false;
+              if (isPvpNonRetryableMessage(message)) return false;
               if (message?.stopReason === "error") return true;
             }
             return origIsRetryable ? origIsRetryable.call(this, message) : false;

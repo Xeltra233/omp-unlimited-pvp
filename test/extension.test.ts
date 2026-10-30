@@ -19,12 +19,14 @@ function createMockExtensionApi(): {
   handlers: Map<string, EventHandler[]>;
   commands: Map<string, any>;
   sentMessages: Array<{ content: any; options?: any }>;
+  sentCustomMessages: Array<{ message: any; options?: any }>;
   currentModel: Model | undefined;
   setModelMock: ReturnType<typeof mock>;
 } {
   const handlers = new Map<string, EventHandler[]>();
   const commands = new Map<string, any>();
   const sentMessages: Array<{ content: any; options?: any }> = [];
+  const sentCustomMessages: Array<{ message: any; options?: any }> = [];
   let currentModel: Model | undefined = undefined;
 
   const setModelMock = mock(async (model: Model) => {
@@ -44,6 +46,9 @@ function createMockExtensionApi(): {
     sendUserMessage(content: any, options?: any) {
       sentMessages.push({ content, options });
     },
+    sendMessage(message: any, options?: any) {
+      sentCustomMessages.push({ message, options });
+    },
     setModel: setModelMock as any,
   };
 
@@ -52,6 +57,7 @@ function createMockExtensionApi(): {
     handlers,
     commands,
     sentMessages,
+    sentCustomMessages,
     get currentModel() {
       return currentModel;
     },
@@ -364,5 +370,175 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
 
     expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toBeUndefined();
+  });
+
+  it("continues a turn OMP settled as terminal instead of surfacing 'Retry failed'", async () => {
+    const { api, handlers, commands } = createMockExtensionApi();
+    pvpExtension(api);
+    const ctx = createMockContext();
+
+    await commands.get("pvp").handler("on", ctx);
+
+    const sessionStop = handlers.get("session_stop")![0];
+    const settledError = {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "Error Code upstream_http2_stream_error: Upstream HTTP/2 stream failed",
+      content: [],
+    };
+
+    const result = await sessionStop(
+      {
+        type: "session_stop",
+        messages: [settledError],
+        turn_id: 0,
+        last_assistant_message: settledError,
+        session_id: "test-session",
+        stop_hook_active: false,
+      },
+      ctx
+    );
+
+    // `decision: "block"` bypasses OMP's continuation cap, so retries stay unlimited.
+    expect(result?.decision).toBe("block");
+    expect(result?.reason).toContain("upstream_http2_stream_error");
+    expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 1 次重试)"]);
+    expect(ctx.notifications.some((n) => n.msg.includes("正在无延迟重试"))).toBe(true);
+  });
+
+  it("leaves clean stops, aborts, and context overflows to OMP", async () => {
+    const { api, handlers, commands } = createMockExtensionApi();
+    pvpExtension(api);
+    const ctx = createMockContext();
+    await commands.get("pvp").handler("on", ctx);
+
+    const sessionStop = handlers.get("session_stop")![0];
+    const stopEvent = (message: any) => ({
+      type: "session_stop",
+      messages: [message],
+      turn_id: 0,
+      last_assistant_message: message,
+      session_id: "test-session",
+      stop_hook_active: false,
+    });
+
+    expect(await sessionStop(stopEvent({ role: "assistant", stopReason: "stop", content: [] }), ctx)).toBeUndefined();
+    expect(
+      await sessionStop(stopEvent({ role: "assistant", stopReason: "aborted", content: [] }), ctx)
+    ).toBeUndefined();
+    expect(
+      await sessionStop(
+        stopEvent({
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "prompt is too long: context window overflow",
+          content: [],
+        }),
+        ctx
+      )
+    ).toBeUndefined();
+  });
+
+  it("does not continue settled turns while PVP is off", async () => {
+    const { api, handlers } = createMockExtensionApi();
+    pvpExtension(api);
+    const ctx = createMockContext();
+
+    const sessionStop = handlers.get("session_stop")![0];
+    const settledError = {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "Error Code upstream_http2_stream_error: Upstream HTTP/2 stream failed",
+      content: [],
+    };
+
+    expect(
+      await sessionStop(
+        { type: "session_stop", messages: [settledError], last_assistant_message: settledError, session_id: "s" },
+        ctx
+      )
+    ).toBeUndefined();
+  });
+
+  it("restarts the turn from the auto_retry_end fallback when no continuation lands", async () => {
+    const { api, handlers, commands, sentCustomMessages } = createMockExtensionApi();
+    pvpExtension(api);
+    const ctx = createMockContext();
+    await commands.get("pvp").handler("on", ctx);
+
+    // A failed turn arms PVP's pending retry (as the turn_end handler would).
+    handlers.get("turn_end")![0](
+      {
+        type: "turn_end",
+        turnIndex: 0,
+        message: {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "Error Code upstream_http2_stream_error: Upstream HTTP/2 stream failed",
+          content: [],
+        },
+        toolResults: [],
+      },
+      ctx
+    );
+
+    const autoRetryEnd = handlers.get("auto_retry_end")![0];
+    autoRetryEnd({ type: "auto_retry_end", success: false, attempt: 2, finalError: "stream failed" }, ctx);
+
+    await Bun.sleep(1400);
+
+    expect(sentCustomMessages).toHaveLength(1);
+    expect(sentCustomMessages[0]?.options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
+    expect(sentCustomMessages[0]?.message.display).toBe(false);
+  });
+
+  it("cancels the fallback restart when a fresh turn starts first", async () => {
+    const { api, handlers, commands, sentCustomMessages } = createMockExtensionApi();
+    pvpExtension(api);
+    const ctx = createMockContext();
+    await commands.get("pvp").handler("on", ctx);
+
+    handlers.get("turn_end")![0](
+      {
+        type: "turn_end",
+        turnIndex: 0,
+        message: { role: "assistant", stopReason: "error", errorMessage: "boom", content: [] },
+        toolResults: [],
+      },
+      ctx
+    );
+
+    handlers.get("auto_retry_end")![0]({ type: "auto_retry_end", success: false, attempt: 1 }, ctx);
+    handlers.get("turn_start")![0]({ type: "turn_start", turnIndex: 1, timestamp: Date.now() }, ctx);
+
+    await Bun.sleep(1400);
+    expect(sentCustomMessages).toHaveLength(0);
+  });
+
+  it("resumes a turn that failed while PVP was off when /pvp on is issued", async () => {
+    const { api, handlers, commands, sentCustomMessages } = createMockExtensionApi();
+    pvpExtension(api);
+    const ctx = createMockContext();
+
+    handlers.get("turn_end")![0](
+      {
+        type: "turn_end",
+        turnIndex: 0,
+        message: {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "Error Code upstream_http2_stream_error: Upstream HTTP/2 stream failed",
+          content: [],
+        },
+        toolResults: [],
+      },
+      ctx
+    );
+
+    await commands.get("pvp").handler("on", ctx);
+
+    expect(sentCustomMessages).toHaveLength(1);
+    expect(sentCustomMessages[0]?.message.customType).toBe("pvp-auto-retry");
+    expect(sentCustomMessages[0]?.options?.triggerTurn).toBe(true);
   });
 });
