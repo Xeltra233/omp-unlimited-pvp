@@ -4,7 +4,7 @@ Unlimited automatic retry plugin specifically crafted for **oh-my-pi (OMP)** wit
 
 Enter `/pvp` to raise the native retry budget, disable base backoff and model fallback chains, and retry in place until success or user cancellation. When OMP's native recovery settles a failure first, the plugin takes over instead of leaving the provider error in the chat. See the implementation limits below.
 
-## Compatibility (v0.3.1)
+## Compatibility (v0.3.2)
 
 Individually verified **29 releases**: **18.1.14–18.1.22, 18.2.0–18.2.11, 18.3.0–18.3.5, 18.4.0–18.4.1**. 18.1.14 is the version pinned by the original lockfile and the verified compatibility floor from that batch; earlier and future versions are not verified. That 29-version result comes from a prior standalone compatibility pass, not a re-run of every version in this round; the current watchdog-gate changes do not automatically inherit it.
 
@@ -16,6 +16,7 @@ Verification in an earlier standalone compatibility batch loaded the installed p
 - On the real bundled CLI, nine JSON 503 responses were followed by a successful 10th POST, with `prompt_result` completed and `agentInvoked` / `sessionSettled` true; each of the 10 POSTs carried exactly one user message. In that scenario `/pvp on` happened at startup before live binding and showed the host's 0.5/1/2/4/8s backoff, so it is not evidence of zero cooldown.
 - On the real bundled CLI, an identical HTML 503 after recovery in the same turn parks again and the original request completes. A subsequent prompt in the same session also recovers from a new outage: three gates and five POSTs (503/503/200/503/200), each carrying the current user prompt exactly once.
 - With real `abort_and_prompt`, the old ticket is `aborted`; the replacement parks independently, then completes through its own successful POST and `prompt_result completed`. The old request is not revived.
+- The v0.3.2 cancellation regression uses the real OMP 18.4.1 RPC host and covers both SDK request waits and native continuation waits: `false` yields an `aborted` original ticket with `agentInvoked=true`, `sessionSettled=true`, and an idle session. Recovery cannot revive it during a 2.5-second observation; the next prompt completes through one POST 200 without duplication.
 
 **Limits:** the native retry budget is `999999`, not mathematical infinity. Ordinary 503 base backoff is zero; provider Retry-After, quota waits and context recovery remain governed by OMP. Aborts and context overflows are always left to OMP. Zero delay means continuing immediately once the failure is observed, not identical dispatch timing every round.
 
@@ -118,7 +119,7 @@ Type `/pvp ` and press `Tab` to autocomplete `on`, `off`.
    - No listener assigns `wait`: PVP retries exactly as before (zero behaviour change; this is the state without the wake guard).
    - `wait` still pending: the current run parks in place — the context is not omitted, no retry is counted, the counted-mode success counter does not move; once the wake guard proves the endpoint is back it calls `resolve(true)` and the same run continues its native retry.
    - Dispatchers for the same failure share the wait. A new failed attempt after recovery opens a new gate even when its error text is identical; it cannot reuse the earlier release result.
-   - `resolve(false)`: cancels this run only; PVP stays enabled and the success count/mode are untouched.
+   - `resolve(false)`: ends this run through native host cancellation and completes its lifecycle; PVP stays enabled and the success count/mode are untouched. An already-aborted or superseded signal does not cancel the host again.
    - Rejection: cancels this run and shows the fixed notice `PVP: 看门狗探测失败，本次不重试` without echoing any error text that may contain secrets.
    - `signal` aborts on `/pvp off`, user abort, **model switch**, session switch/fork/tree walk, `session_shutdown`, and a new prompt; a cancelled gate never revives an old run even if it calls `resolve(true)` later (PVP discards stale `wait`s via an epoch counter). A model switch means the active model's `provider`/`id`/`baseUrl` changed: OMP has no `model_select`, so the wake guard handles `session_switch` (the model-epoch boundary) by both `bindModel` (clearing response metadata on a real change) and `cancelGate`, preventing an old model's failure evidence from being attributed to the new one.
    - The wake guard loads as `off`; only an explicit `/wakeguard on` enables it, and it probes **immediately once**, then on a default cadence of `600000` ms (10 minutes), adjustable via `/wakeguard interval`.
@@ -134,12 +135,17 @@ Type `/pvp ` and press `Tab` to autocomplete `on`, `off`.
 # Run unit tests
 bun test
 
+# Native RPC cancellation regression: request and continuation waits
+bun run test:gate-cancel
+
 # Run TypeScript typecheck
 bun run typecheck
 
 # Production build
 bun run build
 ```
+
+The cancellation regression starts the real bundled CLI from the project dependency against temporary loopback HTTP/SSE endpoints. Set `OMP_EXECUTABLE` to use the installed OMP executable instead. It checks terminal results, session settlement, no revival after recovery, a successful new prompt, and process/port cleanup; it never contacts a real provider.
 
 ---
 

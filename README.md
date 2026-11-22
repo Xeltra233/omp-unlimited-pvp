@@ -4,7 +4,7 @@
 
 在 OMP 中输入 `/pvp`，可提高原生重试预算、关闭基础退避并禁用模型 Fallback 链，在失败后就地继续请求，直到成功或用户停止。OMP 原生恢复逻辑提前结算时，插件会接管续跑，不把供应商失败留在聊天里。具体边界见下文。
 
-## 版本兼容（v0.3.1）
+## 版本兼容（v0.3.2）
 
 已逐版本验证共 **29 个发布版本**：**18.1.14～18.1.22、18.2.0～18.2.11、18.3.0～18.3.5、18.4.0～18.4.1**。18.1.14 是原项目锁文件版本，也是该批兼容性验证确认的工作下限；更早版本及未来版本未验收。该 29 版本结论来自此前单独的兼容性验证，并非本轮逐版重跑；当前看门狗门禁相关改动不自动继承该结论。
 
@@ -18,6 +18,7 @@
 - 真 bundled CLI 上，9 次 JSON 503 后第 10 次 POST 返回 200，`prompt_result` completed、`agentInvoked` / `sessionSettled` 为 true；10 次 POST 每次 1 条用户消息。该卡 startup 的 `/pvp on` 早于 live 绑定并出现宿主 0.5/1/2/4/8s 退避，不作为零冷却证据。
 - 真 bundled CLI 的同文 HTML 503 在同一回合恢复后再次故障时重新停泊；最终原请求完成。同会话下一条请求再次故障也恢复完成：共三个门禁、5 次 POST（503/503/200/503/200），每次请求只包含一份当前用户提示。
 - 真 `abort_and_prompt` 替换中，旧请求返回 `aborted`；新请求独立停泊，恢复后由新请求自己的 POST 200 与 `prompt_result completed` 收尾，不复活旧请求。
+- v0.3.2 的真实 OMP 18.4.1 RPC 取消回归覆盖 SDK 请求侧等待与原生 continuation 等待：`false` 后原提示返回 `aborted`、`agentInvoked=true`、`sessionSettled=true` 且会话 idle；恢复后 2.5s 不复活旧请求，下一提示单次 POST 200 真正完成且不重复。
 
 **实现边界**：原生重试预算为 `999999`，并非数学意义上的无限；普通 503 的基础退避为 0。供应商 Retry-After、额度等待、上下文恢复等仍由 OMP 原生逻辑决定。abort 与上下文溢出始终交给 OMP 处理，PVP 不重试。零延迟只保证在事件触发后立即续跑，不保证每次派发时间完全一致。
 
@@ -130,7 +131,7 @@ omp -e /path/to/omp-unlimited-pvp
    - 没有监听方赋值 `wait`：PVP 完全按原逻辑重试（零行为变化；不装看门狗就是这个状态）。
    - `wait` 尚未落定：本次 run 就地挂起——不 omit 上下文、不计重试次数、不动计数模式的成功计数；看门狗探测到接口恢复后 `resolve(true)`，同一个 run 继续原生重试。
    - 同一次失败的多个重试入口共享等待；恢复后新一轮失败即使错误文本完全相同，也重新进入门禁，不复用上一次的放行结果。
-   - `resolve(false)`：取消本次 run，不重试，不关闭 PVP、不改变成功计数与模式。
+   - `resolve(false)`：通过宿主原生取消结束本次 run 并完成回合收尾，不重试、不关闭 PVP、不改变成功计数与模式；已经中止或替换的旧信号不再次取消宿主。
    - reject：取消本次 run，只提示固定文案 `PVP: 看门狗探测失败，本次不重试`，不回显可能含秘密的错误文本。
    - `signal` 会在 `/pvp off`、用户 abort、**模型切换**、切换/分叉会话或 tree 切换、`session_shutdown`、提交新 prompt 时中止；被取消的门禁即使之后才 `resolve(true)` 也不会复活旧 run（PVP 用 epoch 递增丢弃过期 `wait`）。模型切换指活跃模型 `provider`/`id`/`baseUrl` 变化：OMP 没有 `model_select`，看门狗在 `session_switch`（模型纪元边界）里既 `bindModel`（判定改变即清空响应元数据），也 `cancelGate`，避免把旧模型的失败证据归到新模型。
    - 看门狗加载后默认 `off`，只有用户显式 `/wakeguard on` 才启用，并且**立即探测一次**，之后按默认 `600000`ms（10 分钟）节律探测，可用 `/wakeguard interval` 调整。
@@ -148,12 +149,17 @@ omp -e /path/to/omp-unlimited-pvp
 # 运行单元测试套件
 bun test
 
+# 原生 RPC 取消回归：请求侧与原生 continuation 两个入口
+bun run test:gate-cancel
+
 # 运行 TypeScript 类型检查
 bun run typecheck
 
 # 生产构建（输出到 dist/ 目录）
 bun run build
 ```
+
+取消回归默认启动项目依赖内的真实 bundled CLI，使用临时 loopback HTTP/SSE 接口；设置 `OMP_EXECUTABLE` 可改用本机 OMP 可执行文件。它检查终端结果、会话完成、恢复后无旧请求复活、新请求成功与进程/端口释放，不访问真实供应商。
 
 ---
 

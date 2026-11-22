@@ -933,6 +933,7 @@ type StreamFnLike = (model: unknown, context: unknown, options?: Record<string, 
 interface LiveSession {
   agent?: LiveAgent;
   prompt?: (text: string, options?: unknown) => unknown;
+  abort: (options?: { reason?: string }) => Promise<void>;
 }
 
 /**
@@ -970,6 +971,7 @@ export function installPvpRetryHook(
 
     sessionProto.prompt = function (this: LiveSession, text: string, promptOptions?: unknown): unknown {
       const agent = this.agent;
+      const session = this;
       try {
         options?.onSession?.(this);
       } catch {
@@ -992,9 +994,12 @@ export function installPvpRetryHook(
               signal
             );
             if (!proceed) {
-              // Deny only this owned continuation: no `ctx.abort` and no signal
-              // abort, so an unrelated new prompt keeps running.
-              return undefined;
+              const error = deniedRetryError();
+              if (signal?.aborted) throw error;
+              // Native abort must start before this owned continuation ends:
+              // its cancelled result must yield, not enter transport recovery.
+              void session.abort({ reason: error.message });
+              return origContinue.call(this, signal?.aborted ? signal : AbortSignal.abort(error));
             }
             controller.recordRetryAttempt(controller.lastUi, envelope.error);
             return origContinue.call(this, signal);
@@ -1013,6 +1018,7 @@ export function installPvpRetryHook(
           const origStreamFn = agent.streamFn;
           agent.streamFn = function (this: LiveAgent, model: unknown, context: unknown, streamOptions?: unknown) {
             const optionsRecord = (streamOptions ?? {}) as Record<string, unknown>;
+            const requestSignal = optionsRecord.signal as AbortSignal | undefined;
             const baseFetch =
               (optionsRecord.fetch as typeof fetch | undefined) ??
               (globalThis.fetch as typeof fetch).bind(globalThis);
@@ -1025,26 +1031,29 @@ export function installPvpRetryHook(
             let failure: string | undefined;
             let attemptStatus = 0;
             let attemptContentType = "";
-            let denied = false;
             let envelope: object | undefined;
             let parkedBodyRead: Promise<void> | undefined;
 
             const wrappedFetch = async (input: unknown, init?: RequestInit): Promise<Response> => {
-              const signal = init?.signal ?? (optionsRecord.signal as AbortSignal | undefined);
+              const signal = init?.signal ?? requestSignal;
               if (failure !== undefined) {
                 // Wait for the bounded preview without holding the provider's
                 // Response: the SDK has already received it and may consume it
                 // while this runs. The preview only refines classification.
                 if (parkedBodyRead) await parkedBodyRead;
-                if (denied) throw deniedRetryError();
+                if (signal?.aborted) throw signal.reason;
                 const gateEnvelope = envelope ?? {};
                 const proceed = await controller.awaitRetryGate(
                   gateEnvelope, failure, controller.lastUi, signal, false,
                   { status: attemptStatus, contentType: attemptContentType }
                 );
                 if (!proceed) {
-                  denied = true;
-                  throw deniedRetryError();
+                  const error = deniedRetryError();
+                  // Start native cancellation before the provider emits its abort,
+                  // so the original turn yields instead of entering transport recovery.
+                  // An already-cancelled signal belongs to a superseded run.
+                  if (!requestSignal?.aborted) void session.abort({ reason: error.message });
+                  throw error;
                 }
                 controller.recordRetryAttempt(controller.lastUi, failure);
                 failure = undefined;
