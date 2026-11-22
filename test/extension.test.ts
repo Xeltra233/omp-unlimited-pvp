@@ -138,7 +138,7 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     expect(handlers.has("session_shutdown")).toBe(true);
   });
 
-  it("simulates full persistent retry flow with native in-place retry (never sends user messages)", async () => {
+  it("keeps a persistent failure in the transcript and only counts on the real wire retry", async () => {
     const { api, handlers, commands, sentMessages } = createMockExtensionApi();
     pvpExtension(api);
 
@@ -155,7 +155,6 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     };
     const ctx = createMockContext(mockModel);
 
-    // 1. User enters /pvp
     const pvpCmd = commands.get("pvp");
     await pvpCmd.handler("", ctx);
     expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
@@ -163,156 +162,77 @@ describe("PVP Extension End-to-End Lifecycle in OMP", () => {
     expect(ctx.widgets[PVP_WIDGET_KEY]?.options).toEqual({ placement: "belowEditor" });
     expect(ctx.notifications[0]?.msg).toBe("PVP ON");
 
-    // 2. User submits prompt
     const beforeAgentStart = handlers.get("before_agent_start")![0];
     beforeAgentStart({ type: "before_agent_start", prompt: "Build a feature", systemPrompt: [] }, ctx);
 
-    // 3. Model turn 1 fails -> native AgentSession._prepareRetry intercepts
-    const sessionProto = (AgentSession as any).prototype;
-    const fakeSession = {
-      _extensionUIContext: ctx.ui,
-      agent: {
-        state: {
-          messages: [
-            { role: "user", content: [{ type: "text", text: "Build a feature" }] },
-            { role: "assistant", stopReason: "error", errorMessage: "HTTP 500 Server Error" },
-          ],
-        },
-      },
-    };
-
-    const willRetry1 = await sessionProto._prepareRetry.call(fakeSession, {
-      role: "assistant",
-      stopReason: "error",
-      errorMessage: "HTTP 500 Server Error",
-    });
-
-    expect(willRetry1).toBe(true);
-    // CRITICAL: NEVER sends a user message into the chat!
-    expect(sentMessages).toHaveLength(0);
-    // Assistant error message must be removed from agent state so it can continue in place
-    expect(fakeSession.agent.state.messages).toHaveLength(1);
-    expect(fakeSession.agent.state.messages[0].role).toBe("user");
-    // UI reflects retry count
-    expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 1 次重试)"]);
-
-    // 4. Model turn 2 fails again -> native retry 2
-    fakeSession.agent.state.messages.push({
-      role: "assistant",
-      stopReason: "error",
-      errorMessage: "HTTP 503 Service Unavailable",
-    });
-    const willRetry2 = await sessionProto._prepareRetry.call(fakeSession, {
-      role: "assistant",
-      stopReason: "error",
-      errorMessage: "HTTP 503 Service Unavailable",
-    });
-
-    expect(willRetry2).toBe(true);
-    expect(sentMessages).toHaveLength(0);
-    expect(fakeSession.agent.state.messages).toHaveLength(1);
-    expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 2 次重试)"]);
-
-    // 5. Turn 3 succeeds!
+    // A provider failure reaches turn_end; PVP must plan a retry without
+    // injecting a user message into the chat.
     const turnEnd = handlers.get("turn_end")![0];
-    const successMsg = {
-      role: "assistant",
-      content: [{ type: "text", text: "Done!" }],
-      stopReason: "stop",
+    const failureMsg = {
+      role: "assistant" as const,
+      content: [],
+      stopReason: "error" as const,
+      errorMessage: "HTTP 500 Server Error",
     };
-    turnEnd({ type: "turn_end", turnIndex: 2, message: successMsg, toolResults: [] }, ctx);
+    turnEnd({ type: "turn_end", turnIndex: 1, message: failureMsg, toolResults: [] }, ctx);
 
-    // Success resets count: widget must return to clean "pvp on" without retry count
-    expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
+    expect(sentMessages).toHaveLength(0);
+    // The failed reply is never rewritten or dropped by the extension.
+    expect(failureMsg.content).toEqual([]);
+    expect(failureMsg.errorMessage).toBe("HTTP 500 Server Error");
+
+    // Success closes the retry plan and restores the clean status text.
+    const successMsg = { role: "assistant" as const, content: [{ type: "text", text: "Done!" }], stopReason: "stop" as const };
+    turnEnd({ type: "turn_end", turnIndex: 2, message: successMsg, toolResults: [] }, ctx);
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
-    // Still zero user messages sent
     expect(sentMessages).toHaveLength(0);
 
-    // 6. Subsequent new prompt failure must restart counting from 1
-    beforeAgentStart({ type: "before_agent_start", prompt: "New separate task", systemPrompt: [] }, ctx);
-    fakeSession.agent.state.messages = [
-      { role: "user", content: [{ type: "text", text: "New separate task" }] },
-      { role: "assistant", stopReason: "error", errorMessage: "Fail again" },
-    ];
-    await sessionProto._prepareRetry.call(fakeSession, {
-      role: "assistant",
-      stopReason: "error",
-      errorMessage: "Fail again",
-    });
-    expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on (第 1 次重试)"]);
-
-    // 7. Aborting the turn cancels retry and cleans up widget back to "pvp on"
-    const abortMsg = {
-      role: "assistant",
-      content: [],
-      stopReason: "aborted",
-    };
-    turnEnd({ type: "turn_end", turnIndex: 1, message: abortMsg, toolResults: [] }, ctx);
+    // Abort cancels any pending retry and leaves the mode enabled.
+    turnEnd(
+      { type: "turn_end", turnIndex: 3, message: { role: "assistant", content: [], stopReason: "aborted" }, toolResults: [] },
+      ctx
+    );
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp on"]);
   });
 
-  it("simulates /pvp 2 flow: failure -> retry -> first success keeps mode, second success closes it", async () => {
+  it("counts one attempt per gated retry and auto-off after the configured successes", async () => {
     const { api, handlers, commands, sentMessages } = createMockExtensionApi();
     pvpExtension(api);
     const ctx = createMockContext();
 
-    // 1. User enters /pvp 2
     const pvpCmd = commands.get("pvp");
     await pvpCmd.handler("2", ctx);
-    expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp 2"]);
-    expect(ctx.widgets[PVP_WIDGET_KEY]?.options).toEqual({ placement: "belowEditor" });
     expect(ctx.notifications[0]?.msg).toBe("PVP 2");
 
-    // 2. User submits prompt
     const beforeAgentStart = handlers.get("before_agent_start")![0];
     beforeAgentStart({ type: "before_agent_start", prompt: "One shot prompt", systemPrompt: [] }, ctx);
 
-    // 3. Turn fails -> native retry 1
-    const sessionProto = (AgentSession as any).prototype;
-    const fakeSession = {
-      _extensionUIContext: ctx.ui,
-      agent: {
-        state: {
-          messages: [
-            { role: "user", content: [{ type: "text", text: "One shot prompt" }] },
-            { role: "assistant", stopReason: "error", errorMessage: "Network error" },
-          ],
-        },
-      },
-    };
-
-    const willRetry = await sessionProto._prepareRetry.call(fakeSession, {
-      role: "assistant",
-      stopReason: "error",
-      errorMessage: "Network error",
-    });
-
-    expect(willRetry).toBe(true);
-    expect(sentMessages).toHaveLength(0);
-    expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp 2 (第 1 次重试)"]);
-
-    // 4. Retry turn succeeds
+    // No watchdog listener is installed, so the gate lets the retry proceed and
+    // the attempt is counted exactly once.
+    const controllerAttempts: number[] = [];
     const turnEnd = handlers.get("turn_end")![0];
-    const successMsg = {
-      role: "assistant",
-      content: [{ type: "text", text: "Success" }],
-      stopReason: "stop",
-    };
-    turnEnd({ type: "turn_end", turnIndex: 1, message: successMsg, toolResults: [] }, ctx);
+    turnEnd(
+      {
+        type: "turn_end",
+        turnIndex: 1,
+        message: { role: "assistant", content: [], stopReason: "error", errorMessage: "Network error" },
+        toolResults: [],
+      },
+      ctx
+    );
+    controllerAttempts.push(ctx.widgets[PVP_WIDGET_KEY]?.content?.length ?? 0);
 
-    // First success keeps the mode on and credits 1/2
-    expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
+    const successMsg = { role: "assistant" as const, content: [{ type: "text", text: "Success" }], stopReason: "stop" as const };
+    turnEnd({ type: "turn_end", turnIndex: 2, message: successMsg, toolResults: [] }, ctx);
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toEqual(["pvp 2 (1/2)"]);
 
-    // 5. Second success reaches the target and closes the mode
-    turnEnd({ type: "turn_end", turnIndex: 2, message: successMsg, toolResults: [] }, ctx);
-    expect(ctx.statuses[PVP_STATUS_KEY]).toBeUndefined();
+    turnEnd({ type: "turn_end", turnIndex: 3, message: successMsg, toolResults: [] }, ctx);
     expect(ctx.widgets[PVP_WIDGET_KEY]?.content).toBeUndefined();
     expect(ctx.notifications.some((n) => n.msg.includes("PVP OFF"))).toBe(true);
     expect(sentMessages).toHaveLength(0);
+    expect(controllerAttempts).toHaveLength(1);
   });
-
   it("intercepts OMP retry_fallback_applied and restores original model", async () => {
     const { api, handlers, commands, setModelMock } = createMockExtensionApi();
     pvpExtension(api);

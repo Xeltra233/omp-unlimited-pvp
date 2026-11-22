@@ -8,6 +8,7 @@ import {
   PvpController,
   PVP_RETRY_MESSAGE_TYPE,
   PVP_STATUS_KEY,
+  PVP_WAKE_GUARD_CHANNEL,
   PVP_WIDGET_KEY,
   SettingsGuard,
   type PvpAgentMessage,
@@ -28,6 +29,11 @@ const PVP_RESUME_FALLBACK_DELAY_MS = 1200;
 
 const PVP_RESUME_CONTENT = "<pvp-auto-retry>上一条请求失败，继续完成被打断的任务。</pvp-auto-retry>";
 
+/** Narrow a captured live session to the `setModel` surface the cancel path wraps. */
+function isModelSwitchable(session: object): session is { setModel: (...args: unknown[]) => unknown } {
+  return "setModel" in session && typeof (session as { setModel?: unknown }).setModel === "function";
+}
+
 /**
  * OMP Unlimited PVP Extension.
  *
@@ -40,7 +46,46 @@ const PVP_RESUME_CONTENT = "<pvp-auto-retry>上一条请求失败，继续完成
 export default function pvpExtension(pi: ExtensionAPI): void {
   const guard = new SettingsGuard();
   const controller = new PvpController(guard);
-  const uninstallHook = installPvpRetryHook(controller);
+  const bus = pi.events;
+  // The bundled CLI's live SDK namespace. `pi.pi.AgentSession` is the class the
+  // host actually instantiates; the one this module imports is a second copy.
+  const liveSdk = pi.pi as { AgentSession?: unknown } | undefined;
+  let boundSettingsScope: unknown = undefined;
+  // One wrap per live session: stacking would abort the gate several times and
+  // leak a wrapper per prompt.
+  // Kept in a plain list: teardown must restore wrappers even though WeakMap
+  // itself is not iterable.
+  const setModelWraps: Array<{ session: object; orig: (...a: unknown[]) => unknown; wrapped: (...a: unknown[]) => unknown }> = [];
+  const uninstallHook = installPvpRetryHook(controller, {
+    emitRetryGate:
+      bus && typeof bus.emit === "function"
+        ? request => bus.emit(PVP_WAKE_GUARD_CHANNEL, request)
+        : undefined,
+    sdk: liveSdk,
+    // Bind the *real* session settings scope once a live prompt reveals it.
+    // The namespace-level `settings` is a different instance in the bundled CLI.
+    onSession: session => {
+      if (!session || typeof session !== "object" || !("settings" in session)) return;
+      const sessionSettings = session.settings;
+      if (sessionSettings !== undefined && sessionSettings !== boundSettingsScope) {
+        boundSettingsScope = sessionSettings;
+        guard.prepare(sessionSettings);
+        if (controller.enabled) guard.applyAntiFallbackOverrides();
+      }
+      // A model switch must invalidate a parked gate: the wait belonged to the
+      // old endpoint, and its late resume must never restart the new model's run.
+      if (isModelSwitchable(session) && !setModelWraps.some(w => w.session === session)) {
+        const origSetModel = session.setModel;
+        const wrapped: (...args: unknown[]) => unknown = function (this: unknown, ...args: unknown[]) {
+          controller.abortRetryWaits();
+          settledError = undefined;
+          return origSetModel.apply(this, args);
+        };
+        session.setModel = wrapped;
+        setModelWraps.push({ session, orig: origSetModel, wrapped });
+      }
+    },
+  });
   let originalModel: Model | undefined = undefined;
   // Last settled provider error, tracked even while PVP is off so enabling can resume it.
   let settledError: string | undefined = undefined;
@@ -58,19 +103,22 @@ export default function pvpExtension(pi: ExtensionAPI): void {
         // PVP never refuses to enable: the session_stop continuation restarts a failed
         // turn on its own, so retry tuning is a speed-up, not a prerequisite.
         await uninstallHook.ready;
-        await guard.prepare();
-        const overridesActive = guard.applyAntiFallbackOverrides();
-        const overrideFailure = overridesActive
-          ? undefined
-          : (guard.prepareError ?? guard.overrideError ?? "设置覆盖被拒绝");
-        if (overrideFailure !== undefined) {
-          ctx.ui.notify(`PVP: OMP 重试参数不可覆写（${overrideFailure}），续跑由插件兜底。`, "warning");
+        // No live session has been captured yet on a cold enable: the settings
+        // instance only appears with a prompt, so defer quietly and let
+        // onSession apply the overrides then. Only a bound-but-failed write is
+        // a real problem worth surfacing.
+        if (guard.hasScope) {
+          const overridesActive = guard.applyAntiFallbackOverrides();
+          if (!overridesActive) {
+            const overrideFailure = guard.prepareError ?? guard.overrideError ?? "设置覆盖被拒绝";
+            ctx.ui.notify(`PVP: OMP 重试参数不可覆写（${overrideFailure}），续跑由插件兜底。`, "warning");
+          }
         }
       }
       controller.handleCommand(args, ctx);
       if (resumeSettledError !== undefined && controller.enabled) {
         settledError = undefined;
-        restartSettledTurn(ctx.ui, resumeSettledError, true);
+        await restartSettledTurn(ctx.ui, resumeSettledError, true);
       }
     },
   });
@@ -88,10 +136,17 @@ export default function pvpExtension(pi: ExtensionAPI): void {
     }
   };
 
-  const restartSettledTurn = (ui?: PvpUi, error?: string, force: boolean = false): boolean => {
+  const restartSettledTurn = async (ui?: PvpUi, error?: string, force: boolean = false): Promise<boolean> => {
     if (!controller.enabled) return false;
     if (!controller.consumePendingRetry() && !force) return false;
     if (typeof pi.sendMessage !== "function") return false;
+    const proceed = await controller.awaitRetryGate(undefined, error ?? "Unknown error", ui);
+    if (!proceed) {
+      // The gate declined: keep the turn settled and drop every pending restart.
+      clearResumeFallback();
+      controller.cancelRetry();
+      return false;
+    }
     controller.recordRetryAttempt(ui, error);
     pi.sendMessage(
       { customType: PVP_RETRY_MESSAGE_TYPE, content: PVP_RESUME_CONTENT, display: false },
@@ -104,7 +159,7 @@ export default function pvpExtension(pi: ExtensionAPI): void {
     if (!controller.enabled || resumeFallbackTimer !== undefined) return;
     resumeFallbackTimer = setTimeout(() => {
       resumeFallbackTimer = undefined;
-      restartSettledTurn(ui, error);
+      void restartSettledTurn(ui, error);
     }, PVP_RESUME_FALLBACK_DELAY_MS);
     (resumeFallbackTimer as { unref?: () => void }).unref?.();
   };
@@ -118,6 +173,7 @@ export default function pvpExtension(pi: ExtensionAPI): void {
       const current = (ctx as any)?.model ?? (ctx as any)?.models?.current?.();
       if (current) {
         originalModel = current;
+        controller.setRetryGateModel(current);
       }
     } catch {
       // Ignore if model access fails
@@ -127,9 +183,12 @@ export default function pvpExtension(pi: ExtensionAPI): void {
   // Primary guarantee: OMP reaches its stop tail with a pinned error, so hand it a
   // native continuation. `decision: "block"` bypasses OMP's 8-continuation cap,
   // which keeps PVP's retry truly unlimited.
-  pi.on("session_stop", (event, ctx) => {
+  pi.on("session_stop", async (event, ctx) => {
     clearResumeFallback();
-    const continuation = controller.handleSessionStop(event.last_assistant_message as PvpAgentMessage, ctx.ui);
+    const continuation = await controller.handleSessionStop(
+      event.last_assistant_message as PvpAgentMessage,
+      ctx.ui
+    );
     if (!continuation) return undefined;
     return { decision: "block" as const, reason: continuation.reason };
   });
@@ -147,6 +206,28 @@ export default function pvpExtension(pi: ExtensionAPI): void {
   // Any new turn invalidates a pending fallback restart.
   pi.on("turn_start", () => {
     clearResumeFallback();
+  });
+
+  // A session switch/branch/tree walk or shutdown must end a parked gate so a
+  // late wake-guard resume can never restart the run the user already left.
+  // OMP has no `model_select` event; `before_agent_start` below already aborts
+  // parked waits on every new prompt, including after a model switch.
+  pi.on("session_before_switch", () => {
+    clearResumeFallback();
+    controller.abortRetryWaits();
+    settledError = undefined;
+  });
+
+  pi.on("session_before_branch", () => {
+    clearResumeFallback();
+    controller.abortRetryWaits();
+    settledError = undefined;
+  });
+
+  pi.on("session_before_tree", () => {
+    clearResumeFallback();
+    controller.abortRetryWaits();
+    settledError = undefined;
   });
 
   // Anti-Fallback safety net: if OMP emits retry_fallback_applied while PVP is enabled,
@@ -185,6 +266,11 @@ export default function pvpExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", (_event, ctx) => {
     clearResumeFallback();
     uninstallHook();
+    for (const { session, orig, wrapped } of setModelWraps.splice(0)) {
+      if ("setModel" in session && session.setModel === wrapped) {
+        (session as { setModel: unknown }).setModel = orig;
+      }
+    }
     controller.cleanup(ctx.ui);
     originalModel = undefined;
   });
